@@ -23,6 +23,13 @@ if Code.ensure_loaded?(Plug) do
     the resolved `%AshAi.Tool{}`, its argument map, and the request's Ash tool
     context. It must return `{:ok, arguments}` or `{:error, message}`. Rejections
     are rendered as ordinary MCP tool errors in the selected protocol envelope.
+
+    An `error_formatter` option overrides tool-call error text, for example to
+    render policy denials in plain language. It receives each underlying Ash
+    error and returns a string, or `nil` to keep the default text (`"forbidden"`
+    for policy denials). See `AshAi.Tool.Errors.format/2`. Router options given
+    to Phoenix `forward` are compile-time, so pass a remote capture
+    (`&MyApp.McpErrors.format/1`) or `{module, function, args}`, not a closure.
     """
 
     use Plug.Router, copy_opts_to_assign: :router_opts

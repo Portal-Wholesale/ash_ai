@@ -112,6 +112,36 @@ defmodule AshAi.Dsl do
       type: :string,
       doc: "A description for the tool. Defaults to the action's description."
     ],
+    title: [
+      type: :string,
+      doc:
+        "A human-readable display name for the tool, emitted as the MCP `title`. Omitted from `tools/list` when unset."
+    ],
+    annotations: [
+      type: :keyword_list,
+      keys: [
+        read_only_hint: [
+          type: :boolean,
+          doc: "Emitted as MCP `readOnlyHint`: the tool does not modify its environment."
+        ],
+        destructive_hint: [
+          type: :boolean,
+          doc: "Emitted as MCP `destructiveHint`: the tool may perform destructive updates."
+        ],
+        idempotent_hint: [
+          type: :boolean,
+          doc:
+            "Emitted as MCP `idempotentHint`: repeated calls with the same arguments have no additional effect."
+        ],
+        open_world_hint: [
+          type: :boolean,
+          doc:
+            "Emitted as MCP `openWorldHint`: the tool interacts with an open world of external entities."
+        ]
+      ],
+      doc:
+        "MCP tool annotation hints. Only the hints given are emitted; `tools/list` omits `annotations` when none are set."
+    ],
     identity: [
       type: :atom,
       default: nil,
@@ -257,7 +287,8 @@ defmodule AshAi.Dsl do
       end
       """,
       ~s|tool :get_board, Board, :read, _meta: %{"openai/outputTemplate" => "ui://widget/kanban-board.html", "openai/toolInvocation/invoking" => "Preparing the board…", "openai/toolInvocation/invoked" => "Board ready."}|,
-      ~s(tool :list_artists, Artist, :read, ui: "ui://artists/list.html")
+      ~s(tool :list_artists, Artist, :read, ui: "ui://artists/list.html"),
+      ~s(tool :list_artists, Artist, :read, title: "List artists", annotations: [read_only_hint: true, open_world_hint: false])
     ],
     target: AshAi.Tool,
     schema: @tool_schema,

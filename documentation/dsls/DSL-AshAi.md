@@ -76,6 +76,10 @@ tool :get_board, Board, :read, _meta: %{"openai/outputTemplate" => "ui://widget/
 tool :list_artists, Artist, :read, ui: "ui://artists/list.html"
 ```
 
+```
+tool :list_artists, Artist, :read, title: "List artists", annotations: [read_only_hint: true, open_world_hint: false]
+```
+
 
 
 ### Arguments
@@ -96,6 +100,8 @@ tool :list_artists, Artist, :read, ui: "ui://artists/list.html"
 | [`select`](#tools-tool-select){: #tools-tool-select } | `list(atom)` |  | A list of attributes to return for the tool's resource. When set, only these attributes are read and included in the tool's response, instead of all public attributes. Private attributes may be listed here, which will then be included in the response. Note that private attributes still cannot be used for filtering, sorting, or aggregation. Fields listed in `load` are included in the response in addition to those listed here. |
 | [`async`](#tools-tool-async){: #tools-tool-async } | `boolean` | `true` |  |
 | [`description`](#tools-tool-description){: #tools-tool-description } | `String.t` |  | A description for the tool. Defaults to the action's description. |
+| [`title`](#tools-tool-title){: #tools-tool-title } | `String.t` |  | A human-readable display name for the tool, emitted as the MCP `title`. Omitted from `tools/list` when unset. |
+| [`annotations`](#tools-tool-annotations){: #tools-tool-annotations } | `keyword` |  | MCP tool annotation hints. Only the hints given are emitted; `tools/list` omits `annotations` when none are set. |
 | [`identity`](#tools-tool-identity){: #tools-tool-identity } | `atom` |  | The identity to use for update/destroy actions. Defaults to the primary key. Set to `false` to disable entirely. |
 | [`get_by`](#tools-tool-get_by){: #tools-tool-get_by } | `atom \| list(atom)` |  | For read actions, a field or list of fields used to fetch a single record. The fields must be filterable attributes, calculations or aggregates. |
 | [`_meta`](#tools-tool-_meta){: #tools-tool-_meta } | `any` | `%{}` | Optional metadata map for tool integrations. Supports provider-specific extensions like OpenAI metadata. Keys and values should be strings to comply with JSON-RPC serialization. |

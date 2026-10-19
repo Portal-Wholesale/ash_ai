@@ -1000,6 +1000,11 @@ defmodule AshAi.Mcp.Server do
           AshAi.Tools.parameter_schema(tool, strict: Keyword.get(opts, :strict, false))
       }
 
+      result =
+        result
+        |> put_if("title", tool.title)
+        |> put_if("annotations", tool_annotations(tool.annotations))
+
       if Tool.has_meta?(tool) do
         Map.put(result, "_meta", tool._meta)
       else
@@ -1008,6 +1013,11 @@ defmodule AshAi.Mcp.Server do
     end)
     |> Enum.sort_by(& &1["name"])
   end
+
+  # The DSL schema restricts annotations to the MCP hint keys, so the
+  # camelCase conversion yields exactly readOnlyHint, destructiveHint, etc.
+  defp tool_annotations([_ | _] = annotations), do: keyword_to_camel_case_map(annotations)
+  defp tool_annotations(_annotations), do: nil
 
   defp resource_definitions(opts) do
     action_resources =
@@ -1033,7 +1043,7 @@ defmodule AshAi.Mcp.Server do
 
         case transform_tool_arguments(tool, tool_args, context, opts) do
           {:ok, transformed_args} ->
-            execute_resolved_tool(tool, transformed_args, context)
+            execute_resolved_tool(tool, transformed_args, context, opts)
 
           {:error, error_text} ->
             {:ok, tool_error_result(error_text)}
@@ -1068,8 +1078,11 @@ defmodule AshAi.Mcp.Server do
     end
   end
 
-  defp execute_resolved_tool(tool, arguments, context) do
-    case AshAi.Tools.execute(tool, arguments, context, encode?: false) do
+  defp execute_resolved_tool(tool, arguments, context, opts) do
+    case AshAi.Tools.execute(tool, arguments, context,
+           encode?: false,
+           error_formatter: opts[:error_formatter]
+         ) do
       {:ok, result, _} ->
         case encode_tool_result(tool, result) do
           {:ok, encoded_result} ->

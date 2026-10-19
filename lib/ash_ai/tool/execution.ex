@@ -35,6 +35,7 @@ defmodule AshAi.Tool.Execution do
   - `{:error, error_text}` for execution failures
 
   Set `:encode?` to `false` to return the serialized result before JSON encoding.
+  Set `:error_formatter` to customize error text; see `AshAi.Tool.Errors.format/2`.
   """
   def run(
         %AshAi.Tool{
@@ -98,7 +99,7 @@ defmodule AshAi.Tool.Execution do
         end
       rescue
         error ->
-          {:error, Errors.format(error)}
+          {:error, Errors.format(error, Keyword.get(run_opts, :error_formatter))}
       catch
         {:tool_error, error_msg} ->
           {:error, error_msg}

@@ -34,6 +34,8 @@ defmodule AshAi do
       :identity,
       :get_by,
       :description,
+      :title,
+      :annotations,
       :action_parameters,
       :arguments,
       :_meta,
