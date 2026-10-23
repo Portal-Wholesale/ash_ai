@@ -69,6 +69,18 @@ defmodule AshAi.Dsl do
       doc:
         "Whether to generate the full JSON schema for the `filter` parameter of read actions. When `false` (the default), the filter is a free-form object whose shape is explained in the parameter description, keeping the tool definition much smaller. Set to `true` when you need a fully-specified schema, e.g. for strict/grammar-constrained tool calling."
     ],
+    top_level_arguments?: [
+      type: :boolean,
+      default: false,
+      doc: """
+      Whether to publish the action's arguments, and the tool's own arguments, at the root of the
+      tool's input schema instead of under an `input` object. Calls then pass the arguments at the
+      root too. Only supported on generic action tools.
+
+      Use this when a client contract reads top-level fields, such as OpenAI's `search` and `fetch`
+      tools or `openai/fileParams`.
+      """
+    ],
     load: [
       type: :any,
       default: [],

@@ -32,7 +32,8 @@ defmodule AshAi.Tool.Schema do
       strict?: strict?,
       identity: identity,
       get_by: get_by,
-      full_filter_schema?: Map.get(tool, :full_filter_schema?, false)
+      full_filter_schema?: Map.get(tool, :full_filter_schema?, false),
+      top_level_arguments?: Map.get(tool, :top_level_arguments?, false)
     )
   end
 
@@ -111,18 +112,25 @@ defmodule AshAi.Tool.Schema do
     required_action_arguments =
       AshAi.OpenApi.required_write_attributes(resource, action.arguments, action)
 
-    props_with_input =
-      if Enum.empty?(properties) do
-        %{}
-      else
-        %{
-          input: %{
-            type: :object,
-            properties: properties,
-            additionalProperties: false,
-            required: Enum.uniq(required_action_arguments ++ required_tool_arguments)
-          }
-        }
+    required_arguments = Enum.uniq(required_action_arguments ++ required_tool_arguments)
+
+    {props_with_input, required_props} =
+      cond do
+        Keyword.get(opts, :top_level_arguments?, false) ->
+          {properties, required_arguments}
+
+        Enum.empty?(properties) ->
+          {%{}, []}
+
+        true ->
+          {%{
+             input: %{
+               type: :object,
+               properties: properties,
+               additionalProperties: false,
+               required: required_arguments
+             }
+           }, [:input]}
       end
 
     %{
@@ -134,7 +142,7 @@ defmodule AshAi.Tool.Schema do
           get_by_fields: get_by_fields,
           full_filter_schema?: Keyword.get(opts, :full_filter_schema?, false)
         ),
-      required: Map.keys(props_with_input) ++ Enum.map(get_by_fields, & &1.name),
+      required: required_props ++ Enum.map(get_by_fields, & &1.name),
       additionalProperties: false
     }
     |> Jason.encode!()

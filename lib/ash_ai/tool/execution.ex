@@ -47,14 +47,15 @@ defmodule AshAi.Tool.Execution do
           select: select,
           identity: identity,
           get_by: get_by,
-          arguments: tool_arguments
+          arguments: tool_arguments,
+          top_level_arguments?: top_level_arguments?
         },
         client_arguments,
         context,
         run_opts \\ []
       ) do
     arguments = client_arguments || %{}
-    client_input = arguments["input"] || %{}
+    client_input = if top_level_arguments?, do: arguments, else: arguments["input"] || %{}
 
     opts = build_opts(domain, context)
 

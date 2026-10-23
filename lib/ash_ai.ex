@@ -19,7 +19,10 @@ defmodule AshAi do
       AshAi.Transformers.ResourceTools,
       AshAi.Transformers.McpApps
     ],
-    verifiers: [AshAi.Verifiers.McpResourceActionsReturnString]
+    verifiers: [
+      AshAi.Verifiers.McpResourceActionsReturnString,
+      AshAi.Verifiers.TopLevelArgumentsOnGenericActions
+    ]
 
   defmodule Tool do
     @moduledoc "An action exposed to LLM agents"
@@ -41,6 +44,7 @@ defmodule AshAi do
       :_meta,
       :ui,
       full_filter_schema?: false,
+      top_level_arguments?: false,
       load_strict?: false,
       __spark_metadata__: nil
     ]
