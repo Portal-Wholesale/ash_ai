@@ -57,9 +57,87 @@ defmodule AshAi.Transformers.ResourceTools do
   defp validate_tools!(dsl_state, module, resource_dsl?) do
     dsl_state
     |> Transformer.get_entities([:tools])
-    |> Enum.each(&validate_get_by!(&1, dsl_state, module, resource_dsl?))
+    |> Enum.each(fn tool ->
+      validate_get_by!(tool, dsl_state, module, resource_dsl?)
+      validate_read_action!(tool, dsl_state, module, resource_dsl?)
+      validate_query_fields!(tool, dsl_state, module, resource_dsl?)
+      validate_output_schema!(tool, dsl_state, module, resource_dsl?)
+    end)
 
     dsl_state
+  end
+
+  defp validate_output_schema!(%{output_schema?: false}, _dsl_state, _module, _resource_dsl?),
+    do: :ok
+
+  defp validate_output_schema!(tool, dsl_state, module, resource_dsl?) do
+    case fetch_action(tool, dsl_state, resource_dsl?) do
+      action when is_struct(action) ->
+        with {:error, message} <- AshAi.Tool.OutputSchema.validate(tool, action) do
+          raise Spark.Error.DslError,
+            module: module,
+            path: [:tools, tool.name, :output_schema?],
+            message: message
+        end
+
+      # Deferred or missing actions are checked again when the schema is built
+      _ ->
+        :ok
+    end
+  end
+
+  @query_field_options [:filterable_fields, :sortable_fields, :aggregatable_fields]
+
+  defp validate_query_fields!(tool, dsl_state, module, resource_dsl?) do
+    case Enum.filter(@query_field_options, &Map.get(tool, &1)) do
+      [] ->
+        :ok
+
+      options ->
+        case fetch_action(tool, dsl_state, resource_dsl?) do
+          :deferred ->
+            :ok
+
+          %{type: :read} when not is_nil(tool.get_by) ->
+            raise_query_fields_error!(
+              tool,
+              module,
+              hd(options),
+              "`#{hd(options)}` cannot be combined with `get_by`, which does not expose filtering, sorting or aggregates."
+            )
+
+          %{type: :read} ->
+            source = if resource_dsl?, do: dsl_state, else: tool.resource
+
+            for option <- options, field_name <- Map.fetch!(tool, option) do
+              with {:error, message} <-
+                     AshAi.Tool.validate_query_field(source, option, field_name) do
+                raise_query_fields_error!(tool, module, option, message)
+              end
+            end
+
+            :ok
+
+          # A missing action is reported by `validate_get_by!/4` or when the schema is built
+          nil ->
+            :ok
+
+          _action ->
+            raise_query_fields_error!(
+              tool,
+              module,
+              hd(options),
+              "`#{hd(options)}` can only be used with read tools."
+            )
+        end
+    end
+  end
+
+  defp raise_query_fields_error!(tool, module, option, message) do
+    raise Spark.Error.DslError,
+      module: module,
+      path: [:tools, tool.name, option],
+      message: message
   end
 
   defp validate_get_by!(%{get_by: nil}, _dsl_state, _module, _resource_dsl?), do: :ok
@@ -82,6 +160,46 @@ defmodule AshAi.Transformers.ResourceTools do
       _action ->
         raise_get_by_error!(tool, module, "`get_by` can only be used with read tools.")
     end
+  end
+
+  defp validate_read_action!(%{read_action: nil}, _dsl_state, _module, _resource_dsl?), do: :ok
+
+  defp validate_read_action!(tool, dsl_state, module, resource_dsl?) do
+    case fetch_action(tool, dsl_state, resource_dsl?) do
+      %{type: type} when type in [:update, :destroy] ->
+        source = if resource_dsl?, do: dsl_state, else: tool.resource
+
+        case Ash.Resource.Info.action(source, tool.read_action) do
+          %{type: :read} ->
+            :ok
+
+          _ ->
+            raise_read_action_error!(
+              tool,
+              module,
+              "`read_action` must name a read action, but `#{inspect(tool.read_action)}` is not a read action."
+            )
+        end
+
+      %{} ->
+        raise_read_action_error!(
+          tool,
+          module,
+          "`read_action` can only be used with update and destroy tools."
+        )
+
+      # A missing action is reported elsewhere, and domain-level tools whose resource
+      # isn't compiled yet can't be checked here
+      _ ->
+        :ok
+    end
+  end
+
+  defp raise_read_action_error!(tool, module, message) do
+    raise Spark.Error.DslError,
+      module: module,
+      path: [:tools, tool.name, :read_action],
+      message: message
   end
 
   # Domain-level tools reference other modules, which may not be compiled yet. Those are

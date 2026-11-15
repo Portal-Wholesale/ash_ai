@@ -9,7 +9,7 @@ defmodule AshAi.MixProject do
   Integrated LLM features for your Ash application.
   """
 
-  @version "1.1.1"
+  @version "1.5.4"
 
   @source_url "https://github.com/ash-project/ash_ai"
 
@@ -28,7 +28,13 @@ defmodule AshAi.MixProject do
       dialyzer: [plt_add_apps: [:ash, :mix]],
       description: @description,
       source_url: @source_url,
-      homepage_url: @source_url
+      homepage_url: @source_url,
+      hex: [
+        # assent's Sign in with Apple advisory. The fix is assent 0.3.2, which
+        # ash_authentication 4.x can't use (it pins `< 0.3.0`). ash_authentication
+        # is an optional dependency here, so this lock never reaches users.
+        ignore_advisories: ["EEF-CVE-2026-117656"]
+      ]
     ]
   end
 
@@ -81,6 +87,8 @@ defmodule AshAi.MixProject do
         {"README.md", title: "Home"},
         {"documentation/dsls/DSL-AshAi.md", search_data: Spark.Docs.search_data_for(AshAi)},
         {"documentation/models/gemini.md", title: "Gemini"},
+        "documentation/topics/using-mcp-servers-with-tool-loops.md",
+        "documentation/topics/mcp-client-authorization.md",
         "CHANGELOG.md"
       ],
       groups_for_extras: [
@@ -159,7 +167,8 @@ defmodule AshAi.MixProject do
       {:ash, ash_version("~> 3.33 and >= 3.33.6")},
       {:ash_json_api, "~> 1.4 and >= 1.4.27"},
       {:open_api_spex, "~> 3.0"},
-      {:req_llm, "~> 1.24", optional: true},
+      {:telemetry, "~> 1.1"},
+      {:req_llm, "~> 1.29", optional: true},
       {:ash_postgres, "~> 2.5", optional: true},
       {:ash_oban, "~> 0.5", optional: true},
       {:ash_phoenix, "~> 2.0", optional: true},

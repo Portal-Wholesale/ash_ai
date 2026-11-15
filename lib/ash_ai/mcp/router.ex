@@ -30,6 +30,50 @@ if Code.ensure_loaded?(Plug) do
     for policy denials). See `AshAi.Tool.Errors.format/2`. Router options given
     to Phoenix `forward` are compile-time, so pass a remote capture
     (`&MyApp.McpErrors.format/1`) or `{module, function, args}`, not a closure.
+
+    A `tool_definition_transformer` option may be a three-arity function receiving
+    the `%AshAi.Tool{}`, its `tools/list` definition (a map with string keys:
+    `"name"`, `"description"`, `"inputSchema"` and so on), and the request's Ash
+    tool context. It returns the definition to list. With `tool_argument_transformer`,
+    it can add arguments to every tool that the server consumes itself, such as one
+    asking the agent why it's calling the tool, for analytics:
+
+    ```elixir
+    forward "/mcp", AshAi.Mcp.Router,
+      tools: [...],
+      tool_definition_transformer: fn _tool, definition, _context ->
+        update_in(definition, ["inputSchema"], fn schema ->
+          schema
+          |> put_in([Access.key("properties", %{}), "context"], %{
+            "type" => "string",
+            "description" => "Why you're calling this tool, for analytics."
+          })
+        end)
+      end,
+      tool_argument_transformer: fn _tool, arguments, _context ->
+        {:ok, Map.delete(arguments, "context")}
+      end
+    ```
+
+    ## Telemetry
+
+    Each `tools/call` runs in a `:telemetry.span/3` named `[:ash_ai, :mcp, :tool_call]`,
+    so it emits `[:ash_ai, :mcp, :tool_call, :start]`, then `:stop` or `:exception`.
+    Their metadata has:
+
+      * `:tool_name` - the name the client called
+      * `:tool` - the `%AshAi.Tool{}`, or `nil` if there's no such tool
+      * `:arguments` - the arguments as the client sent them, before `tool_argument_transformer`
+      * `:request_meta` - the request's `_meta`, if any
+      * `:session_id` - the MCP session id, if any
+      * `:actor`, `:tenant` and `:context` - who called it, as the tool runs
+
+    `:stop` also has `:result` (the MCP tool result map, or `nil`), `:is_error` and
+    `:error` (`:tool_not_found`, or `nil`). Its measurements include `:duration`.
+
+    `tools/list` and `resources/list` return every entry by default. Pass
+    `list_page_size: n` to return at most `n` entries per response, with a
+    `nextCursor` for the next page.
     """
 
     use Plug.Router, copy_opts_to_assign: :router_opts
@@ -38,17 +82,12 @@ if Code.ensure_loaded?(Plug) do
 
     # DNS-rebinding protection: the transport requires Origin validation on
     # all incoming connections. Configure with `allowed_origins` (a list of
-    # origin strings or a 1-arity predicate); by default localhost origins
-    # and same-host HTTPS origins are accepted, and requests without an
-    # Origin header (non-browser MCP clients) always pass.
+    # origin strings or a 1-arity predicate); by default the router accepts
+    # only localhost origins, and always lets requests without an Origin
+    # header (non-browser MCP clients) through.
     plug(:validate_origin)
 
-    # Parse the request body for JSON
-    plug(Plug.Parsers,
-      parsers: [:json],
-      pass: ["application/json"],
-      json_decoder: Jason
-    )
+    plug(:parse_body)
 
     plug(:match)
     plug(:dispatch)
@@ -76,8 +115,21 @@ if Code.ensure_loaded?(Plug) do
       send_resp(conn, 404, "Not found")
     end
 
-    # sobelow_skip ["XSS.SendResp"]
-    # The 403 body is a static JSON literal; no user input is reflected.
+    @parsers_opts Plug.Parsers.init(
+                    parsers: [:json],
+                    pass: ["application/json"],
+                    json_decoder: Jason
+                  )
+
+    defp parse_body(conn, _opts) do
+      Plug.Parsers.call(conn, @parsers_opts)
+    rescue
+      Plug.Parsers.ParseError ->
+        conn
+        |> Server.send_error_without_id(400, -32_700, "Parse error")
+        |> halt()
+    end
+
     defp validate_origin(conn, _opts) do
       case Server.check_origin(conn, conn.assigns[:router_opts] || []) do
         :ok ->
@@ -85,15 +137,7 @@ if Code.ensure_loaded?(Plug) do
 
         :forbidden ->
           conn
-          |> put_resp_header("content-type", "application/json")
-          |> send_resp(
-            403,
-            Jason.encode!(%{
-              "jsonrpc" => "2.0",
-              "id" => nil,
-              "error" => %{"code" => -32_600, "message" => "Origin not allowed"}
-            })
-          )
+          |> Server.send_error_without_id(403, -32_600, "Origin not allowed")
           |> halt()
       end
     end

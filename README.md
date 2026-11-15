@@ -71,11 +71,21 @@ mcp server will be available under `http://localhost:4000/ash_ai/mcp`.
 
 We are still experimenting to see what tools (if any) are useful while developing with agents.
 
+Other packages can add tools to the dev server. Pass Ash domains that use the `AshAi`
+extension as `dev_tool_domains`, and the tools declared in their `tools do` sections are
+served alongside the built-in ones:
+
+```elixir
+    plug AshAi.Mcp.Dev,
+      otp_app: :your_app,
+      dev_tool_domains: [SomePackage.DevTools]
+```
+
 ### Production MCP Server
 
 AshAi provides a pre-built MCP server that can be used to expose your tool definitions to an MCP client (typically some kind of IDE, or Claude Desktop for example).
 
-The server supports MCP protocol versions `2026-07-28`, `2025-06-18`, and `2025-03-26`.
+The server supports MCP protocol versions `2026-07-28`, `2025-11-25`, `2025-06-18`, and `2025-03-26`.
 
 #### Roadmap
 
@@ -194,7 +204,7 @@ To try it out from scratch:
 mix igniter.new my_app \
   --with phx.new \
   --install ash,ash_postgres,ash_phoenix \
-  --install ash_authentication_phoenix,ash_oban \
+  --install ash_authentication,ash_authentication_phoenix,ash_oban \
   --install ash_ai@github:ash-project/ash_ai \
   --auth-strategy password
 ```
@@ -293,7 +303,7 @@ defmodule MyApp.Blog do
 
     # Return JSON data with custom description
     mcp_resource :post_metadata, "file://data/post.json", Post, :metadata do
-      description "Metadata about the post including author and tags",
+      description "Metadata about the post including author and tags"
       mime_type "application/json"
     end
   end
@@ -304,11 +314,57 @@ Resources are exposed via the MCP server at `/mcp` and can be accessed by MCP-co
 
 **Description Behavior**: Resource descriptions default to the action's description. You can override this by providing a `description` option in the DSL, which takes precedence.
 
+### Resource templates and binary contents
+
+A URI containing `{...}` is an [RFC 6570](https://datatracker.ietf.org/doc/html/rfc6570) URI template. Templated resources are listed by `resources/templates/list`, and each template variable is passed to the action as the argument with the same name. Templates support `{var}` (one path segment), `{+var}` (which can span segments), and a trailing `{?var,...}` (optional query parameters). Variables are client input, so validate them like any other argument.
+
+An action that returns `:binary` is sent as a base64 blob. When the MIME type varies per read, as it does for photos, set `contents` to build the result yourself:
+
+```elixir
+mcp_resources do
+  # photos://42?size=thumb reads the :get action with id: "42", size: "thumb"
+  mcp_resource :photo, "photos://{id}{?size}", Photo, :get do
+    title "Photo"
+    contents &MyAppWeb.McpViews.photo/2
+  end
+end
+
+# in MyAppWeb.McpViews
+def photo(%Photo{} = photo, _context) do
+  AshAi.McpResource.Contents.blob(MyApp.Storage.read!(photo.key), mime_type: photo.mime_type)
+end
+```
+
+A resource whose action returns `nil` or fails with `Ash.Error.Query.NotFound` is reported as not found. See `AshAi.McpResource` and `AshAi.McpResource.Contents` for the details.
+
+### Tool titles and annotations
+
+MCP clients decide from a tool's annotations whether to ask the person before calling it and how to present it. Give each tool a `title` and the hints that apply (`read_only_hint`, `destructive_hint`, `idempotent_hint`, `open_world_hint`, the specification's names in snake case). Only the hints you set are sent; the client applies its own defaults to the rest. Per the MCP specification they are hints, not security guarantees.
+
+`annotations` also takes a `title`, sent as `annotations.title`. The specification has clients show the top-level `title` first and fall back to `annotations.title`, which older clients and some directories read instead. Nothing is copied between the two: each is sent only when you set it.
+
+```elixir
+tools do
+  tool :list_posts, MyApp.Blog.Post, :read,
+    title: "List posts",
+    annotations: [read_only_hint: true]
+
+  tool :delete_post, MyApp.Blog.Post, :destroy,
+    title: "Delete post",
+    annotations: [destructive_hint: true, idempotent_hint: true]
+
+  tool :search_web, MyApp.Search, :search,
+    title: "Search the web",
+    annotations: [read_only_hint: true, open_world_hint: true]
+end
+```
+
 ### Tool Data Access
 
 **Important**: Tools have different access levels for different operations:
 - **Filtering/Sorting/Aggregation**: Only public attributes (`public?: true`) can be used
 - **Single-record lookup**: Use `get_by` on read tools to look up one record by filterable fields
+- **Finding the record to change**: Update and destroy tools find their record through the primary read action. Use `read_action` to find it through another read action, whose filters and policies then apply
 - **Arguments**: Only public action arguments are exposed
 - **Response data**: Public attributes are returned by default
 - **Loading data**: Use the `load` option to include relationships, calculations, or additional attributes (including private ones) in responses
@@ -427,6 +483,8 @@ Prompt-backed action options to know:
 - `tools:` can be `false`, `true`, or a list of tool names.
 - `max_iterations:` defaults to `:infinity` for prompt actions (set an integer to bound tool loops).
 - `verbose?: true` enables debug logging for tool loop lifecycle events.
+- `response_schema:` takes a JSON Schema map, or `fn input, context -> schema end`, so the output shape can depend on the input. Without `cast_response:` it requires a `:term` or unconstrained `:map` return.
+- `cast_response:` takes `fn response, input, context -> value end` to turn the model's decoded result into the action's return type before it is cast.
 - Tool loop failures are returned as action errors (with loop reason details) instead of raising runtime exceptions.
 
 ### Using Custom Types for Structured Outputs
@@ -468,6 +526,22 @@ config :req_llm, openai_api_key: System.fetch_env!("OPENAI_API_KEY")
 config :req_llm, anthropic_api_key: System.fetch_env!("ANTHROPIC_API_KEY")
 config :req_llm, google_api_key: System.fetch_env!("GOOGLE_API_KEY")
 ```
+
+### Refusals and fallbacks
+
+Anthropic models can decline a request through their safety classifiers. A refused prompt
+action returns an error naming the refusal category rather than a value. To have Anthropic
+retry refused requests on another model instead, enable server-side fallbacks through
+ReqLLM:
+
+```elixir
+run prompt("anthropic:claude-opus-5",
+  req_llm_opts: [provider_options: [anthropic_fallbacks: "default"]]
+)
+```
+
+`"default"` lets Anthropic choose the fallback model by refusal category; a list such as
+`[%{model: "claude-opus-4-8"}]` names the models to try in order.
 
 For AshAi-specific model notes:
 - [Google Gemini 2.5](/documentation/models/gemini.md)

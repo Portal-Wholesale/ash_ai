@@ -11,6 +11,186 @@ See [Conventional Commits](Https://conventionalcommits.org) for commit guideline
 
 <!-- changelog -->
 
+## [v1.5.4](https://github.com/ash-project/ash_ai/compare/v1.5.3...v1.5.4) (2026-11-10)
+
+
+
+
+### Improvements:
+
+* add `cast_response` option by [@zachdaniel](https://github.com/zachdaniel)
+
+## [v1.5.3](https://github.com/ash-project/ash_ai/compare/v1.5.2...v1.5.3) (2026-11-10)
+
+
+
+
+### Bug Fixes:
+
+* support custom response schemas for term or map by [@zachdaniel](https://github.com/zachdaniel)
+
+## [v1.5.2](https://github.com/ash-project/ash_ai/compare/v1.5.1...v1.5.2) (2026-11-10)
+
+
+
+
+### Improvements:
+
+* add `tool_definition_transformer` and MCP telemetry by [@zachdaniel](https://github.com/zachdaniel)
+
+## [v1.5.1](https://github.com/ash-project/ash_ai/compare/v1.5.0...v1.5.1) (2026-11-07)
+
+
+
+
+### Bug Fixes:
+
+* send an error id, not the error's text, for tool errors ToToolError doesn't describe (CVE-2026-119613) by [@zachdaniel](https://github.com/zachdaniel)
+
+## [v1.5.0](https://github.com/ash-project/ash_ai/compare/v1.4.1...v1.5.0) (2026-11-02)
+
+
+
+
+### Features:
+
+* opt-in outputSchema for tools with typed results by [@zachdaniel](https://github.com/zachdaniel)
+
+* cursor pagination for tools/list and resources/list by [@zachdaniel](https://github.com/zachdaniel)
+
+* support string length constraints in OpenAPI schema (#261) by Kyushu21 [(#261)](https://github.com/ash-project/ash_ai/pull/261)
+
+### Improvements:
+
+* support MCP resources in the tool loop by [@zachdaniel](https://github.com/zachdaniel)
+
+* URI templates, blobs, and content types on tools by [@zachdaniel](https://github.com/zachdaniel)
+
+* add `result_meta` by [@zachdaniel](https://github.com/zachdaniel)
+
+* support filter/sort/aggregate allowlists by [@zachdaniel](https://github.com/zachdaniel)
+
+* add `compact_field_list?` by [@zachdaniel](https://github.com/zachdaniel)
+
+### Bug Fixes:
+
+* tools: name the path of an error inside an embedded argument by [@Munksgaard](https://github.com/Munksgaard) [(#241)](https://github.com/ash-project/ash_ai/pull/241)
+
+* drop empty enum union members from tool schemas by [@zachdaniel](https://github.com/zachdaniel)
+
+* ensure unique tool names by [@zachdaniel](https://github.com/zachdaniel)
+
+* fill in error vars when building tool error messages by MuhammedEl-Sayed [(#257)](https://github.com/ash-project/ash_ai/pull/257)
+
+## [v1.4.1](https://github.com/ash-project/ash_ai/compare/v1.4.0...v1.4.1) (2026-10-25)
+
+
+
+
+### Bug Fixes:
+
+* support more attribute types by [@zachdaniel](https://github.com/zachdaniel)
+
+* ensure all datetime types get proper open api schema handling by [@zachdaniel](https://github.com/zachdaniel)
+
+* honor strict load request on write actions by [@zachdaniel](https://github.com/zachdaniel)
+
+* require identity in update/destroy tool input by [@zachdaniel](https://github.com/zachdaniel)
+
+## [v1.4.0](https://github.com/ash-project/ash_ai/compare/v1.3.0...v1.4.0) (2026-10-22)
+
+
+
+
+### Features:
+
+* mcp: tool titles, annotations and server icons (#252) by Ryan Winchester [(#252)](https://github.com/ash-project/ash_ai/pull/252)
+
+* add MCP OAuth by [@zachdaniel](https://github.com/zachdaniel)
+
+* add MCP client by [@zachdaniel](https://github.com/zachdaniel)
+
+### Improvements:
+
+* better handling of invalid arguments in prompt-backed actions by [@zachdaniel](https://github.com/zachdaniel)
+
+* let AshAi.Mcp.Dev serve tools from other AshAi domains (#254) by [@lukegalea](https://github.com/lukegalea) [(#254)](https://github.com/ash-project/ash_ai/pull/254)
+
+### Bug Fixes:
+
+* MCP server name uses the otp_app, and the installer's fallback warning shows the plug (#255) by [@lukegalea](https://github.com/lukegalea) [(#255)](https://github.com/ash-project/ash_ai/pull/255)
+
+## [v1.3.0](https://github.com/ash-project/ash_ai/compare/v1.2.0...v1.3.0) (2026-10-19)
+
+
+
+
+### Features:
+
+* add tool search by [@zachdaniel](https://github.com/zachdaniel)
+
+* add tool call approval by [@zachdaniel](https://github.com/zachdaniel)
+
+* rework chat storage model by [@zachdaniel](https://github.com/zachdaniel)
+
+### Bug Fixes:
+
+* keep the tool loop's last message on Anthropic by [@zachdaniel](https://github.com/zachdaniel)
+
+## [v1.2.0](https://github.com/ash-project/ash_ai/compare/v1.1.2...v1.2.0) (2026-10-13)
+
+
+
+
+### Features:
+
+* mcp: support HTML renderers for UI resources (#248) by [@kosciak9](https://github.com/kosciak9) [(#248)](https://github.com/ash-project/ash_ai/pull/248)
+
+## [v1.1.2](https://github.com/ash-project/ash_ai/compare/v1.1.1...v1.1.2) (2026-10-12)
+
+
+
+
+### Improvements:
+
+* fetch req_llm after installer adds dependency (#240) by [@barnabasJ](https://github.com/barnabasJ) [(#240)](https://github.com/ash-project/ash_ai/pull/240)
+
+### Bug Fixes:
+
+* respect system prompt option in ToolLoop.run & stream by [@zachdaniel](https://github.com/zachdaniel)
+
+* report refusals and missing structured output from prompt actions by [@zachdaniel](https://github.com/zachdaniel)
+
+* multiple MCP spec compliance issues and 2025-11-25 revision support (#246) by leonqadirie [(#246)](https://github.com/ash-project/ash_ai/pull/246)
+
+* mcp: omit null resource descriptions by leonqadirie [(#246)](https://github.com/ash-project/ash_ai/pull/246)
+
+* mcp: reject malformed JSON-RPC envelopes by leonqadirie [(#246)](https://github.com/ash-project/ash_ai/pull/246)
+
+* mcp: answer malformed JSON with a -32700 Parse error by leonqadirie [(#246)](https://github.com/ash-project/ash_ai/pull/246)
+
+* mcp: validate required tools/call and resources/read params by leonqadirie [(#246)](https://github.com/ash-project/ash_ai/pull/246)
+
+* mcp: send list tool results as structuredContent for 2026-07-28 by leonqadirie [(#246)](https://github.com/ash-project/ash_ai/pull/246)
+
+* mcp: reject Mcp-Name values that need Base64 encoding by leonqadirie [(#246)](https://github.com/ash-project/ash_ai/pull/246)
+
+* mcp: omit the id from 2026-07-28 Origin rejections by leonqadirie [(#246)](https://github.com/ash-project/ash_ai/pull/246)
+
+* mcp: answer DELETE with 405 for every protocol version by leonqadirie [(#246)](https://github.com/ash-project/ash_ai/pull/246)
+
+* mcp: reject JSON-RPC batches from 2025-06-18 on by leonqadirie [(#246)](https://github.com/ash-project/ash_ai/pull/246)
+
+* mcp: reject unsupported MCP-Protocol-Version headers with 400 by leonqadirie [(#246)](https://github.com/ash-project/ash_ai/pull/246)
+
+* mcp: validate 2026-07-28 headers before params by leonqadirie [(#246)](https://github.com/ash-project/ash_ai/pull/246)
+
+* resolve an aggregate field's own type before folding it, so avg works (#244) by Daniel Gollings [(#244)](https://github.com/ash-project/ash_ai/pull/244)
+
+* Remove legacy MCP protocol version from generated setup (#239) by [@barnabasJ](https://github.com/barnabasJ) [(#239)](https://github.com/ash-project/ash_ai/pull/239)
+
+* properly create json so req_llm's stripping code works by [@zachdaniel](https://github.com/zachdaniel)
+
 ## [v1.1.1](https://github.com/ash-project/ash_ai/compare/v1.1.0...v1.1.1) (2026-09-23)
 
 

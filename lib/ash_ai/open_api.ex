@@ -47,11 +47,14 @@ defmodule AshAi.OpenApi do
     |> with_attribute_description(attr)
   end
 
+  # Keywords and tuples take the same `fields` constraint as maps, and cast
+  # from a map keyed by field name.
   def resource_write_attribute_type(
-        %{type: Ash.Type.Map, constraints: constraints} = attr,
+        %{type: type, constraints: constraints} = attr,
         resource,
         action_type
-      ) do
+      )
+      when type in [Ash.Type.Map, Ash.Type.Keyword, Ash.Type.Tuple] do
     if constraints[:fields] && constraints[:fields] != [] do
       %{
         type: :object,
@@ -104,7 +107,7 @@ defmodule AshAi.OpenApi do
       end)
 
     %{
-      "anyOf" => subtypes
+      "anyOf" => reject_unmatchable_members(subtypes)
     }
     |> unwrap_any_of()
     |> with_attribute_description(attr)
@@ -177,6 +180,16 @@ defmodule AshAi.OpenApi do
   end
 
   defp with_union_type_tag(schema, _config), do: schema
+
+  # A member with an empty `enum` (e.g. an enum whose values were all retired) can
+  # never match. Members are only dropped while at least one remains, so a union of
+  # nothing but empty enums still rejects every value instead of becoming "any".
+  defp reject_unmatchable_members(subtypes) do
+    case Enum.reject(subtypes, &(Map.get(&1, :enum, Map.get(&1, "enum")) == [])) do
+      [] -> subtypes
+      matchable -> matchable
+    end
+  end
 
   defp add_null_for_non_required(%{required: required} = schema)
        when is_list(required) do
@@ -484,12 +497,14 @@ defmodule AshAi.OpenApi do
     )
   end
 
-  defp resource_attribute_type(%{type: Ash.Type.String}, _resource) do
+  defp resource_attribute_type(%{type: Ash.Type.String} = attr, _resource) do
     %{type: :string}
+    |> add_string_constraints(Map.get(attr, :constraints))
   end
 
-  defp resource_attribute_type(%{type: Ash.Type.CiString}, _resource) do
+  defp resource_attribute_type(%{type: Ash.Type.CiString} = attr, _resource) do
     %{type: :string}
+    |> add_string_constraints(Map.get(attr, :constraints))
   end
 
   defp resource_attribute_type(%{type: Ash.Type.Boolean}, _resource) do
@@ -506,9 +521,10 @@ defmodule AshAi.OpenApi do
   end
 
   defp resource_attribute_type(
-         %{type: Ash.Type.Map, constraints: constraints} = attr,
+         %{type: type, constraints: constraints} = attr,
          resource
-       ) do
+       )
+       when type in [Ash.Type.Map, Ash.Type.Keyword, Ash.Type.Tuple] do
     if constraints[:fields] && constraints[:fields] != [] do
       %{
         type: :object,
@@ -547,16 +563,18 @@ defmodule AshAi.OpenApi do
     %{type: :string, format: :date}
   end
 
-  defp resource_attribute_type(%{type: Ash.Type.UtcDatetime}, _resource) do
-    %{type: :string, format: :"date-time"}
-  end
-
-  defp resource_attribute_type(%{type: Ash.Type.UtcDatetimeUsec}, _resource) do
+  # `:utc_datetime` and `:utc_datetime_usec` are NewTypes over this, so they
+  # reach it through NewType unwrapping.
+  defp resource_attribute_type(%{type: Ash.Type.DateTime}, _resource) do
     %{type: :string, format: :"date-time"}
   end
 
   defp resource_attribute_type(%{type: Ash.Type.NaiveDatetime}, _resource) do
     %{type: :string, format: :"date-time"}
+  end
+
+  defp resource_attribute_type(%{type: Ash.Type.Duration}, _resource) do
+    %{type: :string, format: :duration}
   end
 
   defp resource_attribute_type(%{type: Ash.Type.Time}, _resource) do
@@ -619,7 +637,7 @@ defmodule AshAi.OpenApi do
       end)
 
     %{
-      "anyOf" => subtypes
+      "anyOf" => reject_unmatchable_members(subtypes)
     }
     |> unwrap_any_of()
     |> with_attribute_description(attr)
@@ -778,6 +796,21 @@ defmodule AshAi.OpenApi do
 
       {:less_than, exclusive_max}, schema ->
         Map.put(schema, :exclusiveMaximum, exclusive_max)
+    end)
+  end
+
+  defp add_string_constraints(schema, constraints) do
+    (constraints || [])
+    |> Keyword.take([:min_length, :max_length])
+    |> Enum.reduce(schema, fn
+      {:min_length, min}, schema when is_integer(min) ->
+        Map.put(schema, :minLength, min)
+
+      {:max_length, max}, schema when is_integer(max) ->
+        Map.put(schema, :maxLength, max)
+
+      _, schema ->
+        schema
     end)
   end
 

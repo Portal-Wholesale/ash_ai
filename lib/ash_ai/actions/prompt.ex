@@ -25,7 +25,7 @@ if Code.ensure_loaded?(ReqLLM) do
                       # Action Inputs
 
                       <%= for argument <- @input.action.arguments,
-                          {:ok, value} = Ash.ActionInput.fetch_argument(@input, argument.name),
+                          {:ok, value} <- [Ash.ActionInput.fetch_argument(@input, argument.name)],
                           {:ok, value} = Ash.Type.dump_to_embedded(argument.type, value, argument.constraints) do %>
                         - <%= argument.name %>: <%= Jason.encode!(value) %>
                       <% end %>
@@ -72,6 +72,60 @@ if Code.ensure_loaded?(ReqLLM) do
     - `:extra_tools` - Additional arbitrary `ReqLLM.Tool`s to expose during tool-calling.
     - `:max_iterations` - Maximum tool-loop iterations. Defaults to `:infinity` for prompt actions.
     - `:verbose?` - When true, logs tool-loop lifecycle events with `Logger.debug/1`.
+    - `:response_schema` - A JSON Schema for the result, or a function returning one. See below.
+    - `:cast_response` - A function turning the model's response into the return type. See below.
+
+    ## Dynamic response schemas
+
+    By default the structured output schema is derived from the action's return type.
+    When the shape of the result depends on the input, return `:term` (or a `:map`
+    without `fields` constraints) and provide `:response_schema`. It is either a JSON
+    Schema map or a function (`fn input, context -> schema end`, also arity 1 or 0)
+    returning a schema, `{:ok, schema}`, or `{:error, error}`.
+
+    The schema describes the result value itself; it is wrapped in the same
+    `{"result": ...}` envelope used for derived schemas, including `null` when the
+    action has `allow_nil? true`. The model's output is returned as decoded JSON,
+    with string keys.
+
+    For any other return type, also provide `:cast_response`: a function
+    (`fn response, input, context -> value end`, also arity 2 or 1) that turns the
+    decoded `result` value into the return type. It may return the value,
+    `{:ok, value}`, or `{:error, error}`. Its output is still cast to the return type
+    and checked against its constraints. When the action has `allow_nil? true` it is
+    also called with `nil`.
+
+    ```elixir
+    action :extract, MyApp.Extraction do
+      argument :fields, {:array, :string}, allow_nil?: false
+
+      run prompt("openai:gpt-4o",
+        response_schema: fn input, _context -> MyApp.Extraction.schema_for(input.arguments.fields) end,
+        cast_response: fn response, input, _context ->
+          MyApp.Extraction.from_response(response, input.arguments.fields)
+        end
+      )
+    end
+    ```
+
+    ```elixir
+    action :extract, :map do
+      argument :text, :string, allow_nil?: false
+      argument :fields, {:array, :string}, allow_nil?: false
+
+      run prompt("openai:gpt-4o",
+        prompt: {"Extract the requested fields.", "<%= @input.arguments.text %>"},
+        response_schema: fn input, _context ->
+          %{
+            "type" => "object",
+            "properties" => Map.new(input.arguments.fields, &{&1, %{"type" => "string"}}),
+            "required" => input.arguments.fields,
+            "additionalProperties" => false
+          }
+        end
+      )
+    end
+    ```
 
     ## Model metadata
 
@@ -134,20 +188,22 @@ if Code.ensure_loaded?(ReqLLM) do
     """
     use Ash.Resource.Actions.Implementation
 
+    @result_request "Now give your final answer in the required format."
+
     def run(input, opts, context) do
       model = resolve_model_spec(opts[:model], input, context)
       action = input.action
       {returns, constraints} = AshAi.Actions.Result.unwrap(action.returns, action.constraints)
-      schema = build_json_schema(action.allow_nil?, returns, constraints)
-      initial_context = build_context(input, opts, context)
 
       req_llm_module = Keyword.get(opts, :req_llm, ReqLLM)
       req_llm_opts = Keyword.get(opts, :req_llm_opts, [])
 
-      flow_state =
-        build_flow_state(initial_context, model, req_llm_module, req_llm_opts, context, opts)
-
-      with {:ok, flow_state} <- apply_flow_customizations(flow_state, context, opts),
+      with {:ok, schema} <-
+             build_json_schema(action.allow_nil?, returns, constraints, input, opts, context),
+           {:ok, initial_context} <- build_context(input, opts, context),
+           flow_state =
+             build_flow_state(initial_context, model, req_llm_module, req_llm_opts, context, opts),
+           {:ok, flow_state} <- apply_flow_customizations(flow_state, context, opts),
            {:ok, final_context, loop_usage} <- maybe_run_tools(flow_state, input, opts),
            {:ok, generated} <-
              flow_state.req_llm.generate_object(
@@ -155,19 +211,43 @@ if Code.ensure_loaded?(ReqLLM) do
                final_context,
                schema,
                flow_state.req_llm_opts
-             ) do
-        {result, response} =
-          case generated do
-            %{object: result} -> {result, generated}
-            result when is_map(result) -> {result, nil}
-          end
-
+             ),
+           {:ok, result, response} <- extract_generated(generated),
+           {:ok, result} <- apply_cast_response(unwrap_result(result), input, opts, context) do
+        # `cast_result/3` returns a bare `:ok` for actions without a return type.
         with {:ok, value} <- cast_result(result, returns, constraints) do
           wrap_result(value, response, loop_usage, action)
         end
       else
         {:error, error} ->
           {:error, error}
+      end
+    end
+
+    # A response without an object means the model produced no parseable structured
+    # output (e.g. a refusal or a truncated response); report why instead of casting nil.
+    defp extract_generated(%{object: nil} = response) do
+      {:error, Ash.Error.Unknown.UnknownError.exception(error: missing_output_message(response))}
+    end
+
+    defp extract_generated(%{object: result} = response), do: {:ok, result, response}
+    defp extract_generated(result) when is_map(result), do: {:ok, result, nil}
+
+    defp missing_output_message(response) do
+      case Map.get(response, :finish_reason) do
+        :content_filter ->
+          category =
+            case get_in(Map.get(response, :provider_meta) || %{}, ["stop_details", "category"]) do
+              nil -> ""
+              category -> " (category: #{category})"
+            end
+
+          "The model refused the request#{category}. For Anthropic models, server-side " <>
+            "fallbacks can retry refused requests on another model: " <>
+            ~s|req_llm_opts: [provider_options: [anthropic_fallbacks: "default"]]|
+
+        finish_reason ->
+          "The model returned no structured output (finish reason: #{inspect(finish_reason)})"
       end
     end
 
@@ -273,6 +353,7 @@ if Code.ensure_loaded?(ReqLLM) do
           {:ok, loop_opts} ->
             case AshAi.ToolLoop.run(flow_state.messages, loop_opts) do
               {:ok, %AshAi.ToolLoop.Result{messages: messages, usage: usage}} ->
+                messages = ask_for_result(messages)
                 {:ok, ReqLLM.Context.new(messages), usage || %{}}
 
               {:error, reason} ->
@@ -293,6 +374,20 @@ if Code.ensure_loaded?(ReqLLM) do
         end
       else
         {:ok, ReqLLM.Context.new(flow_state.messages), %{}}
+      end
+    end
+
+    # The structured output request continues the tool loop's conversation,
+    # which ends with the model's answer in prose. Sending that as the last
+    # message would be an assistant prefill, which Anthropic rejects, so ask for
+    # the result in a user turn instead.
+    defp ask_for_result(messages) do
+      case List.last(messages) do
+        %{role: :assistant} ->
+          messages ++ [ReqLLM.Context.user(@result_request)]
+
+        _ ->
+          messages
       end
     end
 
@@ -402,39 +497,146 @@ if Code.ensure_loaded?(ReqLLM) do
       tool_selection == true or (is_list(tool_selection) and tool_selection != [])
     end
 
-    defp build_json_schema(allow_nil?, returns, constraints) do
-      if returns do
-        inner_schema = return_inner_schema(%{returns: returns, constraints: constraints})
-
-        result_schema =
-          if allow_nil? do
-            %{"anyOf" => [%{"type" => "null"}, inner_schema]}
-          else
-            inner_schema
-          end
-
-        %{
-          "type" => "object",
-          "properties" => %{
-            "result" => result_schema
-          },
-          "required" => ["result"],
-          "additionalProperties" => false
-        }
-        # The return type's schema has atom keys, but providers post-process the
-        # schema by string key (e.g. stripping unsupported `minimum`/`maximum`).
-        |> Jason.encode!()
-        |> Jason.decode!()
-      else
-        %{
-          "type" => "object",
-          "properties" => %{
-            "result" => %{"type" => "null"}
-          },
-          "required" => ["result"],
-          "additionalProperties" => false
-        }
+    defp build_json_schema(allow_nil?, returns, constraints, input, opts, context) do
+      with {:ok, inner_schema} <-
+             result_inner_schema(
+               returns,
+               constraints,
+               opts[:response_schema],
+               input,
+               opts,
+               context
+             ) do
+        {:ok, wrap_result_schema(allow_nil?, inner_schema)}
       end
+    end
+
+    defp wrap_result_schema(_allow_nil?, nil) do
+      %{
+        "type" => "object",
+        "properties" => %{
+          "result" => %{"type" => "null"}
+        },
+        "required" => ["result"],
+        "additionalProperties" => false
+      }
+    end
+
+    defp wrap_result_schema(allow_nil?, inner_schema) do
+      result_schema =
+        if allow_nil? do
+          %{"anyOf" => [%{"type" => "null"}, inner_schema]}
+        else
+          inner_schema
+        end
+
+      %{
+        "type" => "object",
+        "properties" => %{
+          "result" => result_schema
+        },
+        "required" => ["result"],
+        "additionalProperties" => false
+      }
+      # The return type's schema has atom keys, but providers post-process the
+      # schema by string key (e.g. stripping unsupported `minimum`/`maximum`).
+      |> Jason.encode!()
+      |> Jason.decode!()
+    end
+
+    defp result_inner_schema(nil, _constraints, nil, _input, _opts, _context), do: {:ok, nil}
+
+    defp result_inner_schema(returns, constraints, nil, _input, _opts, _context) do
+      {:ok, return_inner_schema(%{returns: returns, constraints: constraints})}
+    end
+
+    defp result_inner_schema(nil, _constraints, _response_schema, _input, _opts, _context) do
+      {:error,
+       Ash.Error.Unknown.UnknownError.exception(
+         error: "`response_schema` requires the action to declare a return type"
+       )}
+    end
+
+    defp result_inner_schema(returns, constraints, response_schema, input, opts, context) do
+      if opts[:cast_response] || dynamic_schema_return?(returns, constraints) do
+        resolve_response_schema(response_schema, input, context)
+      else
+        {:error,
+         Ash.Error.Unknown.UnknownError.exception(
+           error: """
+           `response_schema` requires the action to return `:term` or a `:map` without `fields` constraints,
+           unless `cast_response` is provided to turn the response into the return type.
+           Got: #{inspect(returns)} with constraints #{inspect(constraints)}
+           """
+         )}
+      end
+    end
+
+    # Without `cast_response`, the model's output is cast straight into the return
+    # type, so a custom schema is limited to return types that accept any shape.
+    defp dynamic_schema_return?(returns, constraints) do
+      case Ash.Type.get_type(returns) do
+        Ash.Type.Term -> true
+        Ash.Type.Map -> unconstrained_map_return?(constraints)
+        _ -> false
+      end
+    end
+
+    defp resolve_response_schema(response_schema, input, context)
+         when is_function(response_schema, 2) do
+      normalize_response_schema(response_schema.(input, context))
+    end
+
+    defp resolve_response_schema(response_schema, input, _context)
+         when is_function(response_schema, 1) do
+      normalize_response_schema(response_schema.(input))
+    end
+
+    defp resolve_response_schema(response_schema, _input, _context)
+         when is_function(response_schema, 0) do
+      normalize_response_schema(response_schema.())
+    end
+
+    defp resolve_response_schema(response_schema, _input, _context) do
+      normalize_response_schema(response_schema)
+    end
+
+    defp apply_cast_response(result, input, opts, context) do
+      case opts[:cast_response] do
+        nil ->
+          {:ok, result}
+
+        fun when is_function(fun, 3) ->
+          normalize_cast_response(fun.(result, input, context))
+
+        fun when is_function(fun, 2) ->
+          normalize_cast_response(fun.(result, input))
+
+        fun when is_function(fun, 1) ->
+          normalize_cast_response(fun.(result))
+
+        other ->
+          {:error,
+           Ash.Error.Unknown.UnknownError.exception(
+             error:
+               "`cast_response` must be a function of arity 1, 2, or 3, got: #{inspect(other)}"
+           )}
+      end
+    end
+
+    defp normalize_cast_response({:ok, value}), do: {:ok, value}
+    defp normalize_cast_response({:error, error}), do: {:error, error}
+    defp normalize_cast_response(value), do: {:ok, value}
+
+    defp normalize_response_schema({:ok, schema}), do: normalize_response_schema(schema)
+    defp normalize_response_schema({:error, error}), do: {:error, error}
+    defp normalize_response_schema(schema) when is_map(schema), do: {:ok, schema}
+
+    defp normalize_response_schema(other) do
+      {:error,
+       Ash.Error.Unknown.UnknownError.exception(
+         error: "`response_schema` must be a JSON Schema map, got: #{inspect(other)}"
+       )}
     end
 
     defp return_inner_schema(%{returns: :map} = action) do
@@ -496,7 +698,7 @@ if Code.ensure_loaded?(ReqLLM) do
     defp maybe_put_option(opts, key, value), do: Keyword.put(opts, key, value)
 
     defp cast_result(result, nil, _constraints) do
-      case unwrap_result(result) do
+      case result do
         nil ->
           :ok
 
@@ -506,9 +708,7 @@ if Code.ensure_loaded?(ReqLLM) do
     end
 
     defp cast_result(result, returns, constraints) do
-      value = unwrap_result(result)
-
-      with {:ok, value} <- Ash.Type.cast_input(returns, value, constraints),
+      with {:ok, value} <- Ash.Type.cast_input(returns, result, constraints),
            {:ok, value} <- Ash.Type.apply_constraints(returns, value, constraints) do
         {:ok, value}
       else
@@ -522,19 +722,24 @@ if Code.ensure_loaded?(ReqLLM) do
     defp unwrap_result(value), do: value
 
     defp build_context(input, opts, context) do
-      prompt = Keyword.get(opts, :prompt, @prompt_template)
+      case Keyword.get(opts, :prompt) do
+        nil ->
+          # The default template renders every argument that was set, so report one
+          # that can't be serialized as an argument error rather than a render crash.
+          with {:ok, _arguments} <- AshAi.Actions.Arguments.dump(input) do
+            {:ok, normalize_to_context(@prompt_template, input, context, true)}
+          end
 
-      case prompt do
         func when is_function(func, 2) ->
           # Content returned from the prompt function is produced at runtime and
           # is frequently built from action arguments (user input). Running it
           # through EEx would compile that text as Elixir source (RCE), so it is
           # used verbatim. EEx templating remains available for the statically
           # configured prompt forms in the other clause.
-          normalize_to_context(func.(input, context), input, context, false)
+          {:ok, normalize_to_context(func.(input, context), input, context, false)}
 
         other ->
-          normalize_to_context(other, input, context, true)
+          {:ok, normalize_to_context(other, input, context, true)}
       end
     end
 

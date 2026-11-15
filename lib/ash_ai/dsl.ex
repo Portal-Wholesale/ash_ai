@@ -19,7 +19,7 @@ defmodule AshAi.Dsl do
       doc: "The name of the argument."
     ],
     type: [
-      type: :any,
+      type: Ash.OptionsHelpers.ash_type(),
       required: true,
       doc: "The Ash type of the argument (e.g., :string, :date, :integer)."
     ],
@@ -63,6 +63,21 @@ defmodule AshAi.Dsl do
       doc:
         "A list of action specific parameters to allow for the underlying action. Only relevant for reads, and defaults to allowing `[:sort, :offset, :limit, :result_type, :filter]`. Paginated actions always expose their page controls (`offset`, and/or `after`/`before` keyset cursors) regardless of this list, since the returned page hands back the value to pass for the next page. `:result_type` may also be given as `result_type: [:count]` to restrict which result types are offered; `:run_query` is always included."
     ],
+    filterable_fields: [
+      type: {:list, :atom},
+      doc:
+        "For read tools, the fields the tool may filter on. Defaults to every public, filterable attribute, calculation and aggregate. Narrowing the list keeps the tool definition small on wide resources; filters on any other field are refused. An empty list removes the `filter` parameter."
+    ],
+    sortable_fields: [
+      type: {:list, :atom},
+      doc:
+        "For read tools, the fields the tool may sort on. Defaults to every public, sortable attribute, calculation and aggregate. Sorts on any other field are refused. An empty list removes the `sort` parameter."
+    ],
+    aggregatable_fields: [
+      type: {:list, :atom},
+      doc:
+        "For read tools, the fields the tool may aggregate with `result_type`. Defaults to every public attribute, calculation and aggregate. Aggregates of any other field are refused. An empty list removes the aggregate result type."
+    ],
     full_filter_schema?: [
       type: :boolean,
       default: false,
@@ -80,6 +95,18 @@ defmodule AshAi.Dsl do
       Use this when a client contract reads top-level fields, such as OpenAI's `search` and `fetch`
       tools or `openai/fileParams`.
       """
+    ],
+    output_schema?: [
+      type: :boolean,
+      default: false,
+      doc:
+        "Whether to publish an MCP `outputSchema` describing the tool's structured result. Supported for generic actions that return an object (a map, struct, typed struct or resource) with `allow_nil? false`, for read tools with `get_by`, and for create, update and destroy tools. Requires a static `load` list. The schema is derived from the result's type and is never stricter than what the tool returns, since clients reject results that don't match it."
+    ],
+    compact_field_list?: [
+      type: :boolean,
+      default: false,
+      doc:
+        "For read tools, whether to list the names of the fields that can be filtered, sorted and aggregated once, in the schema description, instead of in the `filter` description and the `sort` and aggregate `field` enums. Keeps the tool definition much smaller on wide resources. Has no effect with `full_filter_schema?: true`, which keeps every list."
     ],
     load: [
       type: :any,
@@ -124,46 +151,58 @@ defmodule AshAi.Dsl do
       type: :string,
       doc: "A description for the tool. Defaults to the action's description."
     ],
-    title: [
-      type: :string,
-      doc:
-        "A human-readable display name for the tool, emitted as the MCP `title`. Omitted from `tools/list` when unset."
-    ],
-    annotations: [
-      type: :keyword_list,
-      keys: [
-        read_only_hint: [
-          type: :boolean,
-          doc: "Emitted as MCP `readOnlyHint`: the tool does not modify its environment."
-        ],
-        destructive_hint: [
-          type: :boolean,
-          doc: "Emitted as MCP `destructiveHint`: the tool may perform destructive updates."
-        ],
-        idempotent_hint: [
-          type: :boolean,
-          doc:
-            "Emitted as MCP `idempotentHint`: repeated calls with the same arguments have no additional effect."
-        ],
-        open_world_hint: [
-          type: :boolean,
-          doc:
-            "Emitted as MCP `openWorldHint`: the tool interacts with an open world of external entities."
-        ]
-      ],
-      doc:
-        "MCP tool annotation hints. Only the hints given are emitted; `tools/list` omits `annotations` when none are set."
-    ],
     identity: [
       type: :atom,
       default: nil,
       doc:
         "The identity to use for update/destroy actions. Defaults to the primary key. Set to `false` to disable entirely."
     ],
+    read_action: [
+      type: :atom,
+      doc:
+        "For update/destroy actions, the read action used to find the record. Its filters, preparations and policies apply to the lookup, so a record it cannot see is reported as not found. Defaults to the action's `atomic_upgrade_with`, or the primary read action."
+    ],
     get_by: [
       type: {:or, [:atom, {:list, :atom}]},
       doc:
         "For read actions, a field or list of fields used to fetch a single record. The fields must be filterable attributes, calculations or aggregates."
+    ],
+    title: [
+      type: :string,
+      doc:
+        "A short, human-readable name for the tool (MCP `title`). Clients show it instead of the tool's identifier, for example in a confirmation prompt."
+    ],
+    annotations: [
+      type: :keyword_list,
+      default: [],
+      keys: [
+        title: [
+          type: :string,
+          doc:
+            "A human-readable title (`annotations.title`). Clients read the tool's top-level `title` first and fall back to this one; it is sent only when set here, never copied from `title`."
+        ],
+        read_only_hint: [
+          type: :boolean,
+          doc: "The tool does not modify anything (`readOnlyHint`)."
+        ],
+        destructive_hint: [
+          type: :boolean,
+          doc:
+            "The tool may delete or irreversibly change data (`destructiveHint`). Only meaningful when `read_only_hint` is false."
+        ],
+        idempotent_hint: [
+          type: :boolean,
+          doc:
+            "Calling the tool again with the same arguments has no further effect (`idempotentHint`). Only meaningful when `read_only_hint` is false."
+        ],
+        open_world_hint: [
+          type: :boolean,
+          doc:
+            "The tool reaches outside the application, such as the web or a third-party service (`openWorldHint`)."
+        ]
+      ],
+      doc:
+        "MCP tool annotations: an optional `title` and the hints a client uses to decide whether to ask the person before a call and how to present the tool. The MCP specification treats the hints as untrusted, not as security guarantees. Only what you set is sent, so the client applies its own defaults to the rest."
     ],
     _meta: [
       type: :any,
@@ -175,6 +214,12 @@ defmodule AshAi.Dsl do
       type: {:or, [:atom, :string]},
       doc:
         "The `mcp_ui_resource` name (atom) or a `ui://` URI string for MCP Apps. Shortcut for setting `_meta.ui.resourceUri`. When an atom is given, the URI is resolved from the matching `mcp_ui_resource` declaration."
+    ],
+    result_meta: [
+      type:
+        {:spark_function_behaviour, AshAi.Tool.ResultMeta, {AshAi.Tool.ResultMeta.Function, 2}},
+      doc:
+        "Per-call `_meta` for the tool's MCP `tools/call` result, for data the tool's view needs but the model shouldn't read. A module implementing `AshAi.Tool.ResultMeta`, or a function taking the action's unserialized result and an `AshAi.Tool.ResultMeta.Context` and returning a map or `nil`. The map is deep-merged over `_meta`. See `AshAi.Tool.ResultMeta`."
     ]
   ]
 
@@ -193,12 +238,20 @@ defmodule AshAi.Dsl do
     uri: [
       type: :string,
       required: true,
-      doc: "The URI where the resource can be accessed."
+      doc:
+        "The URI where the resource can be accessed, or an RFC 6570 URI template such as `\"photos://{id}\"` whose variables are passed to the action as arguments. Templates support `{var}`, `{+var}` and a trailing `{?var,...}`. See `AshAi.McpResource`."
     ],
     mime_type: [
       type: :string,
-      default: "text/plain",
-      doc: "The MIME type of the resource, e.g. 'application/json', 'image/png', etc."
+      doc:
+        "The MIME type of the resource, e.g. 'application/json', 'image/png', etc. Defaults to `text/plain` for an action returning `:string`, and `application/octet-stream` for one returning `:binary`. With `contents` there is no default, since each read's items can carry their own."
+    ],
+    contents: [
+      type:
+        {:spark_function_behaviour, AshAi.McpResource.Contents,
+         {AshAi.McpResource.Contents.Function, 2}},
+      doc:
+        "Builds the `resources/read` contents from the action's result, for binary data with a MIME type that differs per read, or several items. A module implementing `AshAi.McpResource.Contents`, or a function taking the action's result and an `AshAi.McpResource.Contents.Context` and returning items built with `AshAi.McpResource.Contents.text/2` or `blob/2`. With it, the action may return any type."
     ],
     resource: [type: {:spark, Ash.Resource}, required: true],
     action: [type: :atom, required: true]
@@ -272,7 +325,8 @@ defmodule AshAi.Dsl do
     schema: @tool_argument_schema,
     describe: "An argument to be passed to the tool.",
     target: AshAi.Tool.Argument,
-    args: [:name, :type]
+    args: [:name, :type],
+    transform: {AshAi.Tool.Argument, :transform, []}
   }
 
   @tool %Spark.Dsl.Entity{
@@ -289,6 +343,8 @@ defmodule AshAi.Dsl do
       ~s(tool :get_artist_by_id, Artist, :read, get_by: :id),
       ~s(tool :create_artist, Artist, :create, description: "Create a new artist"),
       ~s(tool :update_artist, Artist, :update, identity: :id, load: [:albums]),
+      ~s(tool :update_artist, Artist, :update, read_action: :read_in_scope),
+      ~s(tool :delete_artist, Artist, :destroy, title: "Delete artist", annotations: [destructive_hint: true, idempotent_hint: true]),
       ~s(tool :list_artists, Artist, :read, load: [albums: [:title]], load_strict?: true),
       ~s(tool :list_artists, Artist, :read, select: [:name]),
       """
@@ -300,7 +356,7 @@ defmodule AshAi.Dsl do
       """,
       ~s|tool :get_board, Board, :read, _meta: %{"openai/outputTemplate" => "ui://widget/kanban-board.html", "openai/toolInvocation/invoking" => "Preparing the board…", "openai/toolInvocation/invoked" => "Board ready."}|,
       ~s(tool :list_artists, Artist, :read, ui: "ui://artists/list.html"),
-      ~s(tool :list_artists, Artist, :read, title: "List artists", annotations: [read_only_hint: true, open_world_hint: false])
+      ~s(tool :artist_chart, Artist, :read, ui: :artist_chart, result_meta: &MyAppWeb.McpViews.artist_chart/2)
     ],
     target: AshAi.Tool,
     schema: @tool_schema,
@@ -326,8 +382,13 @@ defmodule AshAi.Dsl do
     ],
     html_path: [
       type: :string,
-      required: true,
-      doc: "Path to the HTML file on disk. Read at request time."
+      doc: "Path to the HTML file on disk. Read at request time. Mutually exclusive with `html`."
+    ],
+    html: [
+      type: :mfa,
+      doc:
+        "MFA invoked at request time to render HTML. Must return a string or `{:error, message}`. " <>
+          "Only the configured arguments are passed. Mutually exclusive with `html_path`."
     ],
     title: [
       type: :string,
@@ -372,7 +433,7 @@ defmodule AshAi.Dsl do
   @mcp_ui_resource %Spark.Dsl.Entity{
     name: :mcp_ui_resource,
     describe: """
-    A UI resource for MCP Apps — serves a static HTML file that is rendered in a sandboxed
+    A UI resource for MCP Apps — serves HTML from a file or callback, rendered in a sandboxed
     iframe by MCP hosts (like Claude Desktop). Link tools to UI resources using the tool's
     `ui:` option or `_meta.ui.resourceUri`.
 
@@ -383,6 +444,7 @@ defmodule AshAi.Dsl do
       ~s(mcp_ui_resource :artist_dashboard, "ui://artists/dashboard.html", html_path: "priv/mcp_apps/artist_dashboard.html", csp: [connect_domains: ["api.example.com"]])
     ],
     target: AshAi.McpUiResource,
+    transform: {AshAi.McpUiResource, :validate, []},
     schema: @mcp_ui_resource_schema,
     args: [:name, :uri]
   }
@@ -400,9 +462,11 @@ defmodule AshAi.Dsl do
     examples: [
       ~s(mcp_resource :artist_card, "file://info/artist_info.txt", Artist, :artist_info),
       ~s(mcp_resource :artist_card, "file://ui/artist_card.html", Artist, :artist_card, mime_type: "text/html"),
-      ~s(mcp_resource :artist_data, "file://data/artist.json", Artist, :to_json, description: "Artist metadata as JSON", mime_type: "application/json")
+      ~s(mcp_resource :artist_data, "file://data/artist.json", Artist, :to_json, description: "Artist metadata as JSON", mime_type: "application/json"),
+      ~s(mcp_resource :artist_photo, "artists://{id}/photo", Artist, :photo, contents: &MyAppWeb.McpViews.artist_photo/2)
     ],
     target: AshAi.McpResource,
+    transform: {AshAi.McpResource, :transform, []},
     schema: @mcp_resource_schema,
     args: [:name, :uri, :resource, :action]
   }

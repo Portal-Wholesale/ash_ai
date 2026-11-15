@@ -20,7 +20,7 @@ defmodule AshAi do
       AshAi.Transformers.McpApps
     ],
     verifiers: [
-      AshAi.Verifiers.McpResourceActionsReturnString,
+      AshAi.Verifiers.McpResourceActions,
       AshAi.Verifiers.TopLevelArgumentsOnGenericActions
     ]
 
@@ -36,14 +36,21 @@ defmodule AshAi do
       :domain,
       :identity,
       :get_by,
+      :read_action,
       :description,
       :title,
-      :annotations,
       :action_parameters,
       :arguments,
       :_meta,
       :ui,
+      :result_meta,
+      :filterable_fields,
+      :sortable_fields,
+      :aggregatable_fields,
+      annotations: [],
       full_filter_schema?: false,
+      compact_field_list?: false,
+      output_schema?: false,
       top_level_arguments?: false,
       load_strict?: false,
       __spark_metadata__: nil
@@ -62,6 +69,18 @@ defmodule AshAi do
         allow_nil?: true,
         __spark_metadata__: nil
       ]
+
+      @doc false
+      # Resolves a short type name like `:string` to its module, as Ash does for
+      # action arguments, so the input schema can describe the argument.
+      def transform(%__MODULE__{type: type, constraints: constraints} = argument) do
+        type = Ash.Type.get_type!(type)
+
+        case Ash.Type.init(type, constraints) do
+          {:ok, constraints} -> {:ok, %{argument | type: type, constraints: constraints}}
+          {:error, error} -> {:error, error}
+        end
+      end
     end
 
     def has_meta?(%__MODULE__{_meta: meta})
@@ -136,6 +155,73 @@ defmodule AshAi do
       end
     end
 
+    @query_field_uses %{
+      filterable_fields: "filtered on",
+      sortable_fields: "sorted on",
+      aggregatable_fields: "aggregated"
+    }
+
+    @doc false
+    # The fields a read tool offers for filtering, sorting or aggregating: every eligible
+    # public field, narrowed to `allowed` when the tool sets an allow-list for that use.
+    # Raises ArgumentError if `allowed` names a field that is not eligible.
+    def query_fields(resource, kind, allowed \\ nil) do
+      eligible =
+        resource
+        |> Ash.Resource.Info.fields(query_field_types(kind))
+        |> Enum.filter(&(&1.public? && eligible_query_field?(&1, kind)))
+
+      case allowed do
+        nil ->
+          eligible
+
+        allowed ->
+          Enum.each(allowed, fn field_name ->
+            with {:error, message} <- validate_query_field(resource, kind, field_name) do
+              raise ArgumentError, message
+            end
+          end)
+
+          Enum.filter(eligible, &(&1.name in allowed))
+      end
+    end
+
+    @doc false
+    # `resource` may be a resource module or its Spark.Dsl state, so this can run while the
+    # resource itself is being compiled.
+    def validate_query_field(resource, kind, field_name) do
+      use = Map.fetch!(@query_field_uses, kind)
+
+      case Ash.Resource.Info.field(resource, field_name) do
+        %struct{} = field
+        when struct in [Ash.Resource.Attribute, Ash.Resource.Aggregate, Ash.Resource.Calculation] ->
+          cond do
+            !field.public? ->
+              {:error, "`#{inspect(field_name)}` is not public, so it cannot be #{use}"}
+
+            !eligible_query_field?(field, kind) ->
+              {:error, "`#{inspect(field_name)}` cannot be #{use}"}
+
+            true ->
+              {:ok, field}
+          end
+
+        _ ->
+          {:error,
+           "`#{inspect(field_name)}` is not a valid attribute, calculation or aggregate on #{inspect(resource_module(resource))}"}
+      end
+    end
+
+    # Kept in the order each list has always been emitted, so schemas stay byte-identical
+    defp query_field_types(:sortable_fields), do: [:attributes, :calculations, :aggregates]
+    defp query_field_types(_kind), do: [:attributes, :aggregates, :calculations]
+
+    defp eligible_query_field?(field, :filterable_fields),
+      do: field.filterable? && AshAi.OpenApi.filterable_field?(field, nil)
+
+    defp eligible_query_field?(field, :sortable_fields), do: field.sortable?
+    defp eligible_query_field?(_field, :aggregatable_fields), do: true
+
     defp resource_module(resource) when is_atom(resource), do: resource
 
     defp resource_module(dsl_state),
@@ -169,8 +255,30 @@ defmodule AshAi do
     end
     ```
 
-    The action is called when an MCP client requests the resource, and its return value
-    (which must be a string) is sent to the client with the specified MIME type.
+    The action is called when an MCP client reads the resource. An action that
+    returns `:string` is sent as text and one that returns `:binary` as a base64
+    blob, with the resource's MIME type. To choose per read, such as a photo's MIME
+    type, set `contents` (see `AshAi.McpResource.Contents`). An action that returns
+    `nil` or fails with `Ash.Error.Query.NotFound` is sent as resource not found.
+
+    ## URI templates
+
+    A URI containing `{...}` is an RFC 6570 URI template. It is listed by
+    `resources/templates/list` instead of `resources/list`, and each variable is
+    passed to the action as the argument of the same name, percent-decoded:
+
+    ```elixir
+    mcp_resource :photo, "photos://{id}{?size}", Photo, :get do
+      title "Photo"
+      contents &MyAppWeb.McpViews.photo/2
+    end
+    ```
+
+    Supported are `{var}` (one path segment), `{+var}` (may span segments) and a
+    trailing `{?var,...}` (optional query variables; a query naming any other key
+    doesn't match). A URI matching a resource exactly is read from that resource;
+    otherwise templates are tried in the order they're declared. Validate template
+    variables like any other input: a client can put anything in them.
 
     ## Description Behavior
 
@@ -186,7 +294,9 @@ defmodule AshAi do
             title: String.t(),
             description: String.t(),
             uri: String.t(),
-            mime_type: String.t()
+            uri_template: AshAi.Mcp.UriTemplate.t() | nil,
+            mime_type: String.t() | nil,
+            contents: {module(), Keyword.t()} | nil
           }
 
     defstruct [
@@ -197,16 +307,30 @@ defmodule AshAi do
       :title,
       :description,
       :uri,
+      :uri_template,
       :mime_type,
+      :contents,
       __spark_metadata__: nil
     ]
+
+    @doc false
+    def transform(%__MODULE__{uri: uri} = mcp_resource) do
+      if AshAi.Mcp.UriTemplate.template?(uri) do
+        case AshAi.Mcp.UriTemplate.parse(uri) do
+          {:ok, template} -> {:ok, %{mcp_resource | uri_template: template}}
+          {:error, message} -> {:error, "Invalid URI template #{inspect(uri)}: #{message}"}
+        end
+      else
+        {:ok, mcp_resource}
+      end
+    end
   end
 
   defmodule McpUiResource do
     @moduledoc """
     A UI resource for MCP Apps (Model Context Protocol Apps extension).
 
-    UI resources serve static HTML files that are rendered in sandboxed iframes by MCP hosts
+    UI resources serve HTML that is rendered in sandboxed iframes by MCP hosts
     (like Claude Desktop). They are linked to tools via `_meta.ui.resourceUri` and provide
     interactive interfaces for tool results.
 
@@ -222,8 +346,11 @@ defmodule AshAi do
             permissions: [camera: true]
         end
 
-    The HTML file at `html_path` is read at request time and returned with MIME type
-    `text/html;profile=mcp-app`.
+    Configure exactly one of `html_path` or `html`. The file at `html_path` is read
+    at request time. Alternatively, `html: {MyApp.Widget, :render, []}` invokes an
+    MFA at request time. It must return an HTML string or `{:error, message}` with
+    a string error message. Request parameters are not passed to the callback.
+    Both sources are returned with MIME type `text/html;profile=mcp-app`.
 
     See [MCP Apps spec](https://modelcontextprotocol.io/specification/2025-11-25).
     """
@@ -233,7 +360,8 @@ defmodule AshAi do
     @type t :: %__MODULE__{
             name: atom(),
             uri: String.t(),
-            html_path: String.t(),
+            html_path: String.t() | nil,
+            html: mfa() | nil,
             title: String.t() | nil,
             description: String.t() | nil,
             csp: keyword() | nil,
@@ -246,6 +374,7 @@ defmodule AshAi do
       :name,
       :uri,
       :html_path,
+      :html,
       :title,
       :description,
       :csp,
@@ -257,6 +386,16 @@ defmodule AshAi do
 
     @doc "Returns the fixed MIME type for MCP App UI resources."
     def mime_type, do: @mime_type
+
+    @doc false
+    @spec validate(t()) :: {:ok, t()} | {:error, String.t()}
+    def validate(%{html_path: path, html: nil} = resource) when is_binary(path),
+      do: {:ok, resource}
+
+    def validate(%{html_path: nil, html: {_, _, _}} = resource), do: {:ok, resource}
+
+    def validate(_resource),
+      do: {:error, "Configure exactly one of `html_path` or `html` for an MCP UI resource."}
   end
 
   defmodule FullText do
@@ -330,7 +469,12 @@ defmodule AshAi do
         system_prompt: [
           type: {:or, [{:fun, 1}, {:literal, :none}]},
           doc: """
-          A system prompt that takes the provided options and returns a system prompt.
+          A function that takes the validated options and returns a system prompt, or `:none`.
+
+          `AshAi.ToolLoop` sends it ahead of the given messages on every model request. It is
+          not included in `AshAi.ToolLoop.Result.messages`, so pass it again when continuing a
+          conversation from those messages. `AshAi.iex_chat/1` uses a default prompt when this
+          is not set.
 
           You will want to include something like the actor's id if you are chatting as an
           actor.
@@ -441,6 +585,43 @@ defmodule AshAi do
 
           Set to `:infinity` to disable iteration limits.
           """
+        ],
+        approve_tool_call: [
+          type: {:fun, 2},
+          doc: """
+          Decides whether a tool call may run. Receives the call
+          (`%{id: id, name: name, arguments: args}`) and the tool context, and returns
+          `:ok`, `{:deny, reason}`, or `:ask`. `:ask` stops the loop with
+          `status: :awaiting_approval`. See "Approvals" in `AshAi.ToolLoop`.
+          """
+        ],
+        approvals: [
+          type: {:map, :string, :any},
+          default: %{},
+          doc: """
+          Decisions for the calls of a paused round, as a map from tool call id to
+          `:approve` or `{:deny, reason}`. See "Approvals" in `AshAi.ToolLoop`.
+          """
+        ],
+        tool_search: [
+          type: {:or, [:boolean, :keyword_list]},
+          default: false,
+          doc: """
+          Defers tools until the model searches for them. `true` or a keyword list of
+          options. See `AshAi.ToolSearch`.
+          """
+        ],
+        tool_result_images: [
+          type: {:in, [:auto, true, false]},
+          default: :auto,
+          doc: """
+          Whether images in tool results reach the model. `:auto` sends them when the
+          model accepts image input and its provider's API carries images in tool
+          results, and describes them in text otherwise. `true` always sends them, for a
+          provider that accepts them but isn't recognized, and `false` always describes
+          them, for example behind a gateway that drops them. See "Images in tool
+          results" in `AshAi.ToolLoop`.
+          """
         ]
       ]
   end
@@ -469,26 +650,15 @@ defmodule AshAi do
     Interactive IEx chat loop powered by ReqLLM.
     """
     def iex_chat(opts \\ []) do
-      validated_opts = Options.validate!(opts)
+      opts =
+        Keyword.put_new(opts, :system_prompt, fn _opts ->
+          """
+          You are a helpful assistant.
+          Your purpose is to operate the application on behalf of the user.
+          """
+        end)
 
-      base_messages =
-        case validated_opts.system_prompt do
-          :none ->
-            []
-
-          nil ->
-            [
-              Context.system("""
-              You are a helpful assistant.
-              Your purpose is to operate the application on behalf of the user.
-              """)
-            ]
-
-          system_prompt ->
-            [Context.system(system_prompt.(validated_opts))]
-        end
-
-      run_iex_loop(base_messages, opts)
+      run_iex_loop([], opts)
     end
 
     defp run_iex_loop(messages, opts) do
@@ -545,11 +715,19 @@ defmodule AshAi do
           mcp_resource
           | domain: domain,
             action: action,
-            description: mcp_resource.description || action.description
+            description: mcp_resource.description || action.description,
+            mime_type: mcp_resource.mime_type || default_mime_type(mcp_resource, action)
         }
       end)
     end)
   end
+
+  # With `contents`, each read's items carry their own MIME type
+  defp default_mime_type(%McpResource{contents: nil}, %{returns: Ash.Type.Binary}),
+    do: "application/octet-stream"
+
+  defp default_mime_type(%McpResource{contents: nil}, _action), do: "text/plain"
+  defp default_mime_type(%McpResource{}, _action), do: nil
 
   @doc false
   def exposed_mcp_ui_resources(opts) when is_list(opts) do
@@ -688,6 +866,7 @@ defmodule AshAi do
         allowed_tools -> Enum.filter(tools, &(&1.name in allowed_tools))
       end
     end)
+    |> ensure_unique_exposed_tool_names!()
     |> Enum.filter(
       &can?(
         opts.actor,
@@ -752,6 +931,31 @@ defmodule AshAi do
         Tool names must be unique per domain across both:
         - domain-level `tools do ... end`
         - resource-level `tools do ... end`
+        """
+    end
+  end
+
+  # Domains compile independently, so names that collide across domains can only
+  # be caught once every exposed domain is known
+  defp ensure_unique_exposed_tool_names!(tools) do
+    duplicates =
+      tools
+      |> Enum.group_by(& &1.name)
+      |> Enum.filter(fn {_name, tools} -> Enum.count(tools) > 1 end)
+      |> Enum.sort_by(&elem(&1, 0))
+
+    case duplicates do
+      [] ->
+        tools
+
+      duplicates ->
+        raise ArgumentError, """
+        Duplicate tool names found across domains:
+
+        #{Enum.map_join(duplicates, "\n", fn {name, tools} -> "- #{name}: #{Enum.map_join(tools, ", ", &inspect(&1.domain))}" end)}
+
+        Tool names must be unique across every exposed domain. Rename one of the
+        tools, or narrow the exposed tools with the `tools` or `exclude_actions` options.
         """
     end
   end

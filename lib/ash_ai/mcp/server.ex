@@ -18,8 +18,9 @@ defmodule AshAi.Mcp.Server do
   * `2026-07-28`, which carries the protocol version, client identity, and
     capabilities in each request's `_meta` and never performs an
     `initialize` handshake, and
-  * the initialize-based revisions (`2025-06-18` and `2025-03-26`), which
-    negotiate via `initialize` and may use the `Mcp-Session-Id` header.
+  * the initialize-based revisions (`2025-11-25`, `2025-06-18`, and
+    `2025-03-26`), which negotiate via `initialize` and may use the
+    `Mcp-Session-Id` header.
 
   The revision is selected per request: an `initialize` request (or a
   request carrying an initialize-based/absent `MCP-Protocol-Version` header
@@ -39,8 +40,11 @@ defmodule AshAi.Mcp.Server do
 
   # Protocol revisions that declare their version on every request
   @per_request_versions ["2026-07-28"]
-  # Protocol revisions that negotiate their version via `initialize`
-  @initialize_based_versions ["2025-06-18", "2025-03-26"]
+  # Protocol revisions that negotiate their version via `initialize`, newest
+  # first: `initialize` falls back to the head
+  @initialize_based_versions ["2025-11-25", "2025-06-18", "2025-03-26"]
+
+  @list_methods ["tools/list", "resources/list", "resources/templates/list"]
   @supported_protocol_versions @per_request_versions ++ @initialize_based_versions
 
   @meta_protocol_version "io.modelcontextprotocol/protocolVersion"
@@ -76,41 +80,125 @@ defmodule AshAi.Mcp.Server do
       |> Keyword.merge(opts)
 
     body = unwrap_json_params(body)
+    header_version = req_header(conn, "mcp-protocol-version")
+    rules = header_rules(header_version, opts)
 
-    if per_request_version?(body, req_header(conn, "mcp-protocol-version")) do
-      handle_post_2026_07_28(conn, body, opts)
-    else
-      handle_initialize_based_post(conn, body, session_id, opts)
+    cond do
+      is_list(body) and not rules.batching? ->
+        send_error_without_id(
+          conn,
+          400,
+          -32_600,
+          "JSON-RPC batch requests are not supported for protocol version #{header_version}"
+        )
+
+      per_request_version?(body, rules.era) ->
+        handle_post_2026_07_28(conn, body, opts)
+
+      # `initialize` precedes negotiation, so the server skips its header
+      rules.era == :unsupported and not match?(%{"method" => "initialize"}, body) ->
+        payload =
+          error_payload(-32_022, "Unsupported protocol version: #{header_version}", %{
+            "supported" => @supported_protocol_versions,
+            "requested" => header_version
+          })
+
+        send_json(conn, 400, put_error_id(payload, body, rules.omits_unknown_id?))
+
+      true ->
+        opts = Keyword.put(opts, :omits_unknown_id?, rules.omits_unknown_id?)
+        handle_initialize_based_post(conn, body, session_id, opts)
     end
   end
 
-  # sobelow_skip ["XSS.SendResp"]
+  # The transport rules an `MCP-Protocol-Version` header value selects. A
+  # request without the header counts as 2025-03-26. Revision dates are
+  # ISO-8601, so string comparison orders them.
+  #
+  # * `era`: a value that sorts from 2026-07-28 on selects per-request
+  #   semantics. An earlier value selects initialize-based semantics if the
+  #   server supports it, and `:unsupported` otherwise. Both answer an
+  #   unsupported version with HTTP 400 and 2026-07-28's
+  #   UnsupportedProtocolVersionError, which satisfies the earlier revisions
+  #   too, since they define no error body. A configured
+  #   `:protocol_version_statement` counts as supported, because
+  #   `initialize` states it and the client sends it back. A value that is not
+  #   a revision date at all is `:unsupported`, since it would otherwise sort
+  #   above every dated revision.
+  # * `batching?`: 2025-06-18 removed JSON-RPC batching.
+  # * `omits_unknown_id?`: from 2025-11-25 on, the schema types an error's
+  #   id as an optional string or number, so the server leaves an unknown id
+  #   out. Earlier revisions follow JSON-RPC 2.0 and send `null`.
+  defp header_rules(header_version, opts) do
+    version = header_version || "2025-03-26"
+
+    era =
+      cond do
+        not String.match?(version, ~r/\A\d{4}-\d{2}-\d{2}\z/) -> :unsupported
+        version >= hd(@per_request_versions) -> :per_request
+        version in [opts[:protocol_version_statement] | @initialize_based_versions] -> :initialize
+        true -> :unsupported
+      end
+
+    %{era: era, batching?: version < "2025-06-18", omits_unknown_id?: version >= "2025-11-25"}
+  end
+
+  # An error for a request echoes its id. The transports give the error for
+  # a rejected notification no id, and an unreadable id follows the revision's
+  # rule for an unknown id.
+  defp put_error_id(payload, %{"id" => _} = message, omits_unknown_id?) do
+    case request_id(message) do
+      nil -> put_unknown_id(payload, omits_unknown_id?)
+      id -> Map.put(payload, "id", id)
+    end
+  end
+
+  defp put_error_id(payload, %{"method" => _}, _omits_unknown_id?), do: payload
+
+  defp put_error_id(payload, _body, omits_unknown_id?),
+    do: put_unknown_id(payload, omits_unknown_id?)
+
+  defp put_unknown_id(payload, true), do: payload
+  defp put_unknown_id(payload, false), do: Map.put(payload, "id", nil)
+
   defp handle_initialize_based_post(conn, body, session_id, opts) do
     case process_request(body, session_id, opts) do
       {:initialize_response, response, new_session_id} ->
         # Return the initialize response with a session ID header
         conn
-        |> Plug.Conn.put_resp_header("content-type", "application/json")
         |> Plug.Conn.put_resp_header("mcp-session-id", new_session_id)
-        |> Plug.Conn.send_resp(200, response)
+        |> send_encoded_json(200, response)
 
       {:json_response, response, _session_id} ->
-        # Regular JSON response
-        conn
-        |> Plug.Conn.put_resp_header("content-type", "application/json")
-        |> Plug.Conn.send_resp(200, response)
+        # The initialize-based transports answer a POST without requests with
+        # 202 or an HTTP error status, so an error for input the server
+        # cannot accept goes out with 400
+        status = if without_requests?(body), do: 400, else: 200
+        send_encoded_json(conn, status, response)
 
       {:batch_response, response, _session_id} ->
-        # Batch response
-        conn
-        |> Plug.Conn.put_resp_header("content-type", "application/json")
-        |> Plug.Conn.send_resp(200, response)
+        send_encoded_json(conn, 200, response)
 
       {:no_response, _, _} ->
         # For notifications or other messages that don't require a response
         conn
         |> Plug.Conn.send_resp(202, "")
     end
+  end
+
+  # Notifications and client responses expect no answer
+  defp without_requests?([]), do: false
+  defp without_requests?(batch) when is_list(batch), do: Enum.all?(batch, &unanswered?/1)
+  defp without_requests?(message), do: unanswered?(message)
+
+  defp unanswered?(message), do: notification?(message) or response?(message)
+
+  defp notification?(message),
+    do: is_map(message) and is_map_key(message, "method") and not is_map_key(message, "id")
+
+  defp response?(message) do
+    is_map(message) and not is_map_key(message, "method") and
+      (is_map_key(message, "result") or is_map_key(message, "error"))
   end
 
   # Plug.Parsers wraps JSON array bodies (2025-03-26 batch requests) in a "_json" key
@@ -120,60 +208,46 @@ defmodule AshAi.Mcp.Server do
   # Era selection per the 2026-07-28 versioning spec: `initialize` without
   # per-request `_meta` selects initialize-based semantics; with a `_meta`
   # protocol version it is a removed method under 2026-07-28 (404 below).
-  # Otherwise a `_meta` protocol version or an `MCP-Protocol-Version` header
-  # naming a non-initialize-based revision selects per-request semantics.
-  defp per_request_version?(%{"method" => "initialize"} = body, _header_version),
+  # Otherwise a `_meta` protocol version or a per-request header era selects
+  # per-request semantics.
+  defp per_request_version?(%{"method" => "initialize"} = body, _header_era),
     do: is_binary(request_meta_version(body))
 
-  defp per_request_version?(body, header_version) when is_map(body) do
-    cond do
-      is_binary(request_meta_version(body)) ->
-        true
+  defp per_request_version?(body, header_era) when is_map(body),
+    do: is_binary(request_meta_version(body)) or header_era == :per_request
 
-      is_nil(header_version) ->
-        false
-
-      # Every dated revision before 2026-07-28 negotiates via `initialize` —
-      # including ones this server doesn't itself advertise (e.g. a client
-      # sending `2025-11-25` before initialize downgrades it). Route them all
-      # to initialize-based semantics rather than demanding per-request
-      # `_meta` they cannot know about. Revision dates are ISO-8601, so
-      # string comparison orders them correctly.
-      header_version < hd(@per_request_versions) ->
-        false
-
-      true ->
-        true
-    end
-  end
-
-  # Batches are only defined for initialize-based protocol versions. A batch
-  # carrying a current/future per-request version must still enter the current
-  # handler so it can return one bounded Invalid Request response rather than
-  # accidentally using the initialize-era batch path.
-  defp per_request_version?(body, header_version) when is_list(body),
-    do: is_binary(header_version) and header_version >= hd(@per_request_versions)
-
-  defp per_request_version?(_body, _header_version), do: false
+  defp per_request_version?(_body, _header_era), do: false
 
   defp request_meta_version(%{"params" => %{"_meta" => %{@meta_protocol_version => version}}}),
     do: version
 
   defp request_meta_version(_body), do: nil
 
-  defp handle_post_2026_07_28(conn, %{"method" => method, "id" => id} = message, opts) do
+  defp handle_post_2026_07_28(conn, %{"method" => _method} = message, opts) do
+    case invalid_envelope(message) do
+      nil ->
+        handle_message_2026_07_28(conn, message, opts)
+
+      error ->
+        error_response_2026_07_28(conn, 400, request_id(message), -32_600, error)
+    end
+  end
+
+  defp handle_post_2026_07_28(conn, _other, _opts) do
+    error_response_2026_07_28(conn, 400, nil, -32_600, @invalid_request_message)
+  end
+
+  defp handle_message_2026_07_28(conn, %{"method" => method, "id" => id} = message, opts) do
     cond do
       # Structurally invalid `_meta` is Invalid Params, before any version or
       # header comparison (SEP-2575)
       error = validate_request_meta(message) ->
         error_response_2026_07_28(conn, 400, id, -32_602, error)
 
-      error = invalid_params(method, message["params"]) ->
-        error_response_2026_07_28(conn, 400, id, -32_602, error)
-
-      # Header/body consistency comes before version support: a request whose
-      # header disagrees with its `_meta` is a HeaderMismatch even when one
-      # of the two names an unsupported version
+      # Header/body consistency comes before version support and params: the
+      # transport requires HeaderMismatch for any header validation failure,
+      # even when one of the two names an unsupported version or the params
+      # are invalid too
       error = validate_headers_2026_07_28(conn, message) ->
         error_response_2026_07_28(conn, 400, id, -32_020, error)
 
@@ -183,6 +257,11 @@ defmodule AshAi.Mcp.Server do
           "requested" => requested
         })
 
+      # initialize is a removed method here; dispatch answers it with Method
+      # not found naming the supported versions, whatever its params.
+      error = method != "initialize" && invalid_params(method, message["params"]) ->
+        error_response_2026_07_28(conn, 400, id, -32_602, error)
+
       true ->
         dispatch_2026_07_28(conn, method, id, message["params"] || %{}, opts)
     end
@@ -191,23 +270,33 @@ defmodule AshAi.Mcp.Server do
   # Notifications: the core 2026-07-28 protocol defines no client-to-server
   # notifications over Streamable HTTP, and defines no header requirements
   # for notification POSTs. Accept and ignore.
-  defp handle_post_2026_07_28(conn, %{"method" => _method}, _opts) do
+  defp handle_message_2026_07_28(conn, _notification, _opts) do
     Plug.Conn.send_resp(conn, 202, "")
   end
 
-  defp handle_post_2026_07_28(conn, batch, _opts) when is_list(batch) do
-    error_response_2026_07_28(
-      conn,
-      400,
-      nil,
-      -32_600,
-      "JSON-RPC batch requests are not supported for protocol version 2026-07-28"
-    )
+  defp invalid_envelope(message) do
+    cond do
+      message["jsonrpc"] != "2.0" ->
+        ~s(Invalid Request: "jsonrpc" must be "2.0")
+
+      not is_binary(message["method"]) ->
+        ~s(Invalid Request: "method" must be a string)
+
+      is_map_key(message, "id") and is_nil(request_id(message)) ->
+        ~s(Invalid Request: "id" must be a string or number)
+
+      true ->
+        nil
+    end
   end
 
-  defp handle_post_2026_07_28(conn, _other, _opts) do
-    error_response_2026_07_28(conn, 400, nil, -32_600, @invalid_request_message)
-  end
+  # The spec prose asks for "a string or integer ID", but every revision's
+  # schema.ts, which the spec names its source of truth, types `RequestId` as
+  # `string | number`, and JSON-RPC 2.0 only discourages fractional ids
+  # (SHOULD NOT). The server follows the schema and accepts fractional ids;
+  # `null` stays rejected because the prose forbids it explicitly.
+  defp request_id(%{"id" => id}) when is_binary(id) or is_number(id), do: id
+  defp request_id(_message), do: nil
 
   # Every request must carry `_meta` with the protocol version and client
   # capabilities. `clientInfo` is a SHOULD and MUST NOT be required.
@@ -297,8 +386,8 @@ defmodule AshAi.Mcp.Server do
           {:ok, decoded} ->
             "Mcp-Name header value #{inspect(decoded)} does not match body value #{inspect(expected)}"
 
-          :error ->
-            "Mcp-Name header value is not valid Base64 sentinel encoding"
+          {:error, reason} ->
+            "Mcp-Name header value #{reason}"
         end
     end
   end
@@ -311,11 +400,18 @@ defmodule AshAi.Mcp.Server do
          {:ok, decoded} <- Base.decode64(encoded) do
       {:ok, decoded}
     else
-      _ -> :error
+      _ -> {:error, "is not valid Base64 sentinel encoding"}
     end
   end
 
-  defp decode_header_value(value), do: {:ok, value}
+  defp decode_header_value(value) do
+    if plain_header_value?(value),
+      do: {:ok, value},
+      else: {:error, "contains characters that require Base64 sentinel encoding"}
+  end
+
+  # RFC 9110 field values: visible ASCII, space, and horizontal tab
+  defp plain_header_value?(value), do: String.match?(value, ~r/\A[\x20-\x7E\t]*\z/)
 
   defp dispatch_2026_07_28(conn, "server/discover", id, params, opts) do
     result =
@@ -330,9 +426,10 @@ defmodule AshAi.Mcp.Server do
     response_2026_07_28(conn, 200, id, result)
   end
 
-  defp dispatch_2026_07_28(conn, "tools/list", id, _params, opts) do
+  defp dispatch_2026_07_28(conn, "tools/list", id, params, opts) do
     result =
-      %{"tools" => tool_definitions(opts)}
+      params
+      |> tools_list_result(opts)
       |> cacheable_result(opts, :list)
       |> result_2026_07_28(opts)
 
@@ -340,7 +437,10 @@ defmodule AshAi.Mcp.Server do
   end
 
   defp dispatch_2026_07_28(conn, "tools/call", id, params, opts) do
-    case execute_tool_call(params, nil, opts) do
+    case execute_tool_call(params, nil, opts,
+           structured_lists?: true,
+           client_capabilities: client_capabilities_2026_07_28(params)
+         ) do
       {:ok, result} ->
         response_2026_07_28(conn, 200, id, result_2026_07_28(result, opts))
 
@@ -349,9 +449,20 @@ defmodule AshAi.Mcp.Server do
     end
   end
 
-  defp dispatch_2026_07_28(conn, "resources/list", id, _params, opts) do
+  defp dispatch_2026_07_28(conn, "resources/list", id, params, opts) do
     result =
-      %{"resources" => resource_definitions(opts)}
+      params
+      |> resources_list_result(opts)
+      |> cacheable_result(opts, :list)
+      |> result_2026_07_28(opts)
+
+    response_2026_07_28(conn, 200, id, result)
+  end
+
+  defp dispatch_2026_07_28(conn, "resources/templates/list", id, params, opts) do
+    result =
+      params
+      |> resource_templates_list_result(opts)
       |> cacheable_result(opts, :list)
       |> result_2026_07_28(opts)
 
@@ -360,9 +471,9 @@ defmodule AshAi.Mcp.Server do
 
   defp dispatch_2026_07_28(conn, "resources/read", id, %{"uri" => uri} = params, opts) do
     case read_resource_content(uri, params, nil, opts) do
-      {:ok, content} ->
+      {:ok, contents} ->
         result =
-          %{"contents" => [content]}
+          %{"contents" => contents}
           |> cacheable_result(opts, :read)
           |> result_2026_07_28(opts)
 
@@ -378,10 +489,6 @@ defmodule AshAi.Mcp.Server do
           "error" => error
         })
     end
-  end
-
-  defp dispatch_2026_07_28(conn, "resources/read", id, _params, _opts) do
-    error_response_2026_07_28(conn, 200, id, -32_602, "Missing required parameter: uri")
   end
 
   # This server's tool and resource lists are derived from compile-time DSL
@@ -433,10 +540,7 @@ defmodule AshAi.Mcp.Server do
   end
 
   defp result_2026_07_28(result, opts) do
-    server_info = %{
-      "name" => get_server_name(opts),
-      "version" => get_server_version(opts)
-    }
+    server_info = get_server_info(opts)
 
     result
     |> Map.put("resultType", "complete")
@@ -464,18 +568,24 @@ defmodule AshAi.Mcp.Server do
   end
 
   defp error_response_2026_07_28(conn, status, id, code, message, data \\ nil) do
-    error =
-      %{"code" => code, "message" => message}
-      |> maybe_put("data", data)
-
-    send_json(conn, status, %{"jsonrpc" => "2.0", "id" => id, "error" => error})
+    send_json(conn, status, put_if(error_payload(code, message, data), "id", id))
   end
 
+  # A JSON-RPC error response without an id; callers add the id their
+  # revision and message call for
+  defp error_payload(code, message, data \\ nil) do
+    error = maybe_put(%{"code" => code, "message" => message}, "data", data)
+    %{"jsonrpc" => "2.0", "error" => error}
+  end
+
+  defp send_json(conn, status, payload),
+    do: send_encoded_json(conn, status, Jason.encode!(payload))
+
   # sobelow_skip ["XSS.SendResp"]
-  defp send_json(conn, status, payload) do
+  defp send_encoded_json(conn, status, json) do
     conn
     |> Plug.Conn.put_resp_header("content-type", "application/json")
-    |> Plug.Conn.send_resp(status, Jason.encode!(payload))
+    |> Plug.Conn.send_resp(status, json)
   end
 
   defp req_header(conn, name) do
@@ -498,6 +608,16 @@ defmodule AshAi.Mcp.Server do
 
   defp trim_ows(value), do: String.replace(value, ~r/^[ \t]+|[ \t]+$/, "")
 
+  # Send a JSON-RPC error for a request whose `id` the server cannot read, such
+  # as a body that is not valid JSON or one from a forbidden origin. From
+  # 2025-11-25 on, the response omits the `id`; earlier revisions follow
+  # JSON-RPC 2.0 and send `null`. Public only for `AshAi.Mcp.Router`.
+  @doc false
+  def send_error_without_id(conn, status, code, message) do
+    rules = header_rules(req_header(conn, "mcp-protocol-version"), [])
+    send_json(conn, status, put_unknown_id(error_payload(code, message), rules.omits_unknown_id?))
+  end
+
   @doc """
   Validate the `Origin` header of a request per the Streamable HTTP
   transport's DNS-rebinding protection requirement.
@@ -517,7 +637,7 @@ defmodule AshAi.Mcp.Server do
         :ok
 
       [origin] ->
-        if origin_allowed?(trim_ows(origin), conn, opts[:allowed_origins]) do
+        if origin_allowed?(trim_ows(origin), opts[:allowed_origins]) do
           :ok
         else
           :forbidden
@@ -528,7 +648,7 @@ defmodule AshAi.Mcp.Server do
     end
   end
 
-  defp origin_allowed?(origin, _conn, nil) do
+  defp origin_allowed?(origin, nil) do
     # Without an explicit :allowed_origins allowlist, only same-machine
     # (localhost) origins are trusted. The request Host and X-Forwarded-Proto
     # headers are both attacker-controlled - and equal to the origin under DNS
@@ -538,9 +658,9 @@ defmodule AshAi.Mcp.Server do
     localhost_host?(URI.parse(origin).host)
   end
 
-  defp origin_allowed?(origin, _conn, allowed) when is_list(allowed), do: origin in allowed
+  defp origin_allowed?(origin, allowed) when is_list(allowed), do: origin in allowed
 
-  defp origin_allowed?(origin, _conn, allowed) when is_function(allowed, 1),
+  defp origin_allowed?(origin, allowed) when is_function(allowed, 1),
     do: allowed.(origin)
 
   defp localhost_host?(host), do: host in ["localhost", "127.0.0.1", "::1", "[::1]"]
@@ -559,29 +679,23 @@ defmodule AshAi.Mcp.Server do
   """
   def handle_get(conn, _session_id) do
     conn
-    |> Plug.Conn.put_resp_header("allow", "POST, DELETE")
+    |> Plug.Conn.put_resp_header("allow", "POST")
     |> Plug.Conn.send_resp(405, "")
   end
 
   @doc """
-  Handle HTTP DELETE request for session termination
-  """
-  def handle_delete(conn, session_id) do
-    case req_header(conn, "mcp-protocol-version") do
-      version when version in @per_request_versions ->
-        conn
-        |> Plug.Conn.put_resp_header("allow", "POST")
-        |> Plug.Conn.send_resp(405, "")
+  Process an HTTP DELETE request.
 
-      _initialize_based_or_absent ->
-        if session_id do
-          conn
-          |> Plug.Conn.send_resp(200, "")
-        else
-          conn
-          |> Plug.Conn.send_resp(400, "")
-        end
-    end
+  Responds `405 Method Not Allowed` for every protocol version. 2026-07-28
+  removed sessions, and the initialize-based revisions let a server refuse
+  client-initiated session termination this way. The server keeps no session
+  state, so a terminated session would keep answering requests, while those
+  revisions require `404` for every request after termination.
+  """
+  def handle_delete(conn, _session_id) do
+    conn
+    |> Plug.Conn.put_resp_header("allow", "POST")
+    |> Plug.Conn.send_resp(405, "")
   end
 
   @doc """
@@ -600,6 +714,25 @@ defmodule AshAi.Mcp.Server do
         {:error, _} -> {:halt, conn}
       end
     end)
+  end
+
+  @doc """
+  The `serverInfo` sent on `initialize` and in the `_meta` of 2026-07-28
+  results: `name` and `version`, plus `icons` when the `mcp_icons` option is
+  set. `mcp_icons` is a list of icon maps (`src`, and optionally `mimeType`,
+  `sizes` such as `["48x48"]` or `["any"]`, and `theme`, `"light"` or
+  `"dark"`), or a 1-arity function of the request opts that returns one.
+  Hosts that read them show the icon beside the server's name.
+  """
+  def get_server_info(opts) do
+    icons =
+      case opts[:mcp_icons] do
+        fun when is_function(fun, 1) -> fun.(opts)
+        icons -> icons
+      end
+
+    %{"name" => get_server_name(opts), "version" => get_server_version(opts)}
+    |> maybe_put("icons", if(icons == [], do: nil, else: icons))
   end
 
   @doc """
@@ -624,14 +757,10 @@ defmodule AshAi.Mcp.Server do
   Get the MCP server name
   """
   def get_server_name(opts) do
-    if opts[:mcp_name] do
-      opts[:mcp_name]
-    else
-      if opts[:otp_app] do
-        "MCP Server"
-      else
-        "#{opts[:otp_app]} MCP Server"
-      end
+    cond do
+      opts[:mcp_name] -> opts[:mcp_name]
+      opts[:otp_app] -> "#{opts[:otp_app]} MCP Server"
+      true -> "MCP Server"
     end
   end
 
@@ -663,30 +792,45 @@ defmodule AshAi.Mcp.Server do
       {:ok, []} ->
         # JSON-RPC 2.0: an empty batch array is an Invalid Request
         response =
-          json_rpc_error_response(nil, -32_600, "Invalid Request: a batch must not be empty")
+          unknown_id_error_response(opts, -32_600, "Invalid Request: a batch must not be empty")
 
         {:json_response, response, session_id}
 
       {:ok, batch} when is_list(batch) ->
-        # Handle batch requests
-        responses = Enum.map(batch, fn item -> process_message(item, session_id, opts) end)
+        # Handle batch requests. In a batch with requests, the errors go into
+        # the batch body, where JSON-RPC 2.0 requires every error to carry an
+        # id, so a rejected notification's error gets the unknown id too.
+        item_opts =
+          if without_requests?(batch),
+            do: opts,
+            else: Keyword.put(opts, :batched_with_requests?, true)
 
-        # Filter out no_response items and format the response
-        response_items = Enum.filter(responses, fn {type, _, _} -> type != :no_response end)
+        # Pair each item with its result and drop the ones needing no response
+        answered =
+          batch
+          |> Enum.map(fn item -> {item, process_message(item, session_id, item_opts)} end)
+          |> Enum.reject(&match?({_item, {:no_response, _, _}}, &1))
 
-        if Enum.empty?(response_items) do
-          # All items were notifications, no response needed
-          {:no_response, nil, session_id}
-        else
-          # Convert each response to its JSON representation
-          json_responses = Enum.map(response_items, fn {_, json, _} -> json end)
-          {:batch_response, "[#{Enum.join(json_responses, ",")}]", session_id}
+        cond do
+          Enum.empty?(answered) ->
+            # All items were notifications, no response needed
+            {:no_response, nil, session_id}
+
+          without_requests?(batch) ->
+            # A batch without requests gets 202 or an HTTP error status, never
+            # a batch body; handle_initialize_based_post picks the status
+            answered |> hd() |> elem(1)
+
+          true ->
+            # Convert each response to its JSON representation
+            json_responses = Enum.map(answered, fn {_item, {_, json, _}} -> json end)
+            {:batch_response, "[#{Enum.join(json_responses, ",")}]", session_id}
         end
 
       {:error, error} ->
         # Handle parsing errors
         response =
-          json_rpc_error_response(nil, -32_700, "Parse error", %{"details" => inspect(error)})
+          unknown_id_error_response(opts, -32_700, "Parse error", %{"details" => inspect(error)})
 
         {:json_response, response, session_id}
     end
@@ -695,17 +839,21 @@ defmodule AshAi.Mcp.Server do
   @doc """
   Process a single JSON-RPC message
   """
-  def process_message(
-        %{"method" => method, "id" => id, "params" => params} = message,
-        session_id,
-        opts
-      ) do
-    case invalid_params(method, params) do
+  def process_message(%{"method" => _method} = message, session_id, opts) do
+    case invalid_message(message) do
       nil ->
         do_process_message(message, session_id, opts)
 
-      error ->
-        {:json_response, json_rpc_error_response(id, -32_602, error), session_id}
+      {code, error} ->
+        payload = error_payload(code, error)
+        omits_unknown_id? = Keyword.get(opts, :omits_unknown_id?, false)
+
+        response =
+          if opts[:batched_with_requests?] && notification?(message),
+            do: put_unknown_id(payload, omits_unknown_id?),
+            else: put_error_id(payload, message, omits_unknown_id?)
+
+        {:json_response, Jason.encode!(response), session_id}
     end
   end
 
@@ -713,20 +861,63 @@ defmodule AshAi.Mcp.Server do
     do_process_message(message, session_id, opts)
   end
 
+  # An error for a message whose id the server cannot read follows the
+  # revision's rule for an unknown id
+  defp unknown_id_error_response(opts, code, message, data \\ nil) do
+    code
+    |> error_payload(message, data)
+    |> put_unknown_id(Keyword.get(opts, :omits_unknown_id?, false))
+    |> Jason.encode!()
+  end
+
+  # `params` is optional in JSON-RPC; `invalid_params` rejects a missing
+  # `params` for the methods that require it. The server checks only
+  # requests, because the handlers read no notification params.
+  defp invalid_message(message) do
+    cond do
+      error = invalid_envelope(message) ->
+        {-32_600, error}
+
+      error = is_map_key(message, "id") && invalid_params(message["method"], message["params"]) ->
+        {-32_602, error}
+
+      true ->
+        nil
+    end
+  end
+
   # The shapes of the `params` members the handlers read with `Access`. Only
   # the methods that read `params` are checked, so a method that ignores them
   # keeps answering whatever a client sends there.
   defp invalid_params(method, params)
-       when method in ["initialize", "tools/call"] and not is_map(params),
+       when method in ["initialize", "tools/call", "resources/read"] and not is_map(params),
        do: "Invalid params: params must be an object"
+
+  defp invalid_params("tools/call", params)
+       when not is_map_key(params, "name") or not is_binary(:erlang.map_get("name", params)),
+       do: "Invalid params: name must be a string"
 
   defp invalid_params("tools/call", %{"arguments" => arguments})
        when not is_map(arguments) and not is_nil(arguments),
        do: "Invalid params: arguments must be an object"
 
+  defp invalid_params("resources/read", %{"uri" => uri}) when is_binary(uri), do: nil
+
+  defp invalid_params("resources/read", _params), do: "Invalid params: uri must be a string"
+
   defp invalid_params("initialize", %{"capabilities" => capabilities})
        when not is_map(capabilities) and not is_nil(capabilities),
        do: "Invalid params: capabilities must be an object"
+
+  # Checked whether or not paging is enabled, so a client never mistakes an
+  # ignored cursor for the start of the list
+  defp invalid_params(method, %{"cursor" => cursor})
+       when method in @list_methods and not is_nil(cursor) do
+    case decode_cursor(cursor) do
+      {:ok, _after_key} -> nil
+      :error -> "Invalid params: invalid cursor"
+    end
+  end
 
   defp invalid_params(_method, _params), do: nil
 
@@ -743,16 +934,13 @@ defmodule AshAi.Mcp.Server do
         protocol_version_statement =
           opts[:protocol_version_statement] ||
             if(requested_version in @initialize_based_versions, do: requested_version) ||
-            "2025-03-26"
+            hd(@initialize_based_versions)
 
         capabilities = capabilities(opts, params["capabilities"] || %{})
 
         result =
           %{
-            "serverInfo" => %{
-              "name" => get_server_name(opts),
-              "version" => get_server_version(opts)
-            },
+            "serverInfo" => get_server_info(opts),
             "protocolVersion" => protocol_version_statement,
             "capabilities" => capabilities
           }
@@ -767,7 +955,7 @@ defmodule AshAi.Mcp.Server do
         response = %{"jsonrpc" => "2.0", "id" => id, "result" => %{}}
         {:json_response, Jason.encode!(response), session_id}
 
-      %{"method" => "shutdown", "id" => id, "params" => _params} ->
+      %{"method" => "shutdown", "id" => id} ->
         # Return success
         response = %{
           "jsonrpc" => "2.0",
@@ -781,26 +969,32 @@ defmodule AshAi.Mcp.Server do
         # TODO: Cancel request?
         {:no_response, nil, session_id}
 
-      # TODO: this can support paginaton via params later
       %{"method" => "resources/list", "id" => id} ->
         response = %{
           "jsonrpc" => "2.0",
           "id" => id,
-          "result" => %{
-            "resources" => resource_definitions(opts)
-          }
+          "result" => resources_list_result(message["params"], opts)
+        }
+
+        {:json_response, Jason.encode!(response), session_id}
+
+      %{"method" => "resources/templates/list", "id" => id} ->
+        response = %{
+          "jsonrpc" => "2.0",
+          "id" => id,
+          "result" => resource_templates_list_result(message["params"], opts)
         }
 
         {:json_response, Jason.encode!(response), session_id}
 
       %{"method" => "resources/read", "id" => id, "params" => %{"uri" => uri} = params} ->
         case read_resource_content(uri, params, session_id, opts) do
-          {:ok, content} ->
+          {:ok, contents} ->
             response = %{
               "jsonrpc" => "2.0",
               "id" => id,
               "result" => %{
-                "contents" => [content]
+                "contents" => contents
               }
             }
 
@@ -837,9 +1031,7 @@ defmodule AshAi.Mcp.Server do
         response = %{
           "jsonrpc" => "2.0",
           "id" => id,
-          "result" => %{
-            "tools" => tool_definitions(opts)
-          }
+          "result" => tools_list_result(message["params"], opts)
         }
 
         {:json_response, Jason.encode!(response), session_id}
@@ -868,7 +1060,7 @@ defmodule AshAi.Mcp.Server do
             {:json_response, Jason.encode!(response), session_id}
         end
 
-      %{"method" => method, "id" => id, "params" => _params} ->
+      %{"method" => method, "id" => id} ->
         # Handle other requests with IDs (requiring responses)
         response = %{
           "jsonrpc" => "2.0",
@@ -885,9 +1077,15 @@ defmodule AshAi.Mcp.Server do
         # Handle other notifications (no id)
         {:no_response, nil, session_id}
 
+      %{"jsonrpc" => "2.0", "id" => _id} = response
+      when is_map_key(response, "result") or is_map_key(response, "error") ->
+        # The server sends the client no requests, so a client response
+        # answers nothing; the transports accept it with 202
+        {:no_response, nil, session_id}
+
       _other ->
         # Invalid message
-        {:json_response, json_rpc_error_response(nil, -32_600, @invalid_request_message),
+        {:json_response, unknown_id_error_response(opts, -32_600, @invalid_request_message),
          session_id}
     end
   end
@@ -979,50 +1177,171 @@ defmodule AshAi.Mcp.Server do
     |> AshAi.exposed_mcp_ui_resources()
   end
 
+  # Tools are paged before their schemas are built, so a page only pays for its own entries
+  defp tools_list_result(params, opts) do
+    {tools, next_cursor} =
+      opts
+      |> listed_tools()
+      |> page(&to_string(&1.name), params, opts)
+
+    maybe_put(
+      %{"tools" => Enum.map(tools, &tool_definition(&1, opts))},
+      "nextCursor",
+      next_cursor
+    )
+  end
+
+  defp resources_list_result(params, opts) do
+    {resources, next_cursor} = page(resource_definitions(opts), & &1["uri"], params, opts)
+    maybe_put(%{"resources" => resources}, "nextCursor", next_cursor)
+  end
+
+  defp resource_templates_list_result(params, opts) do
+    {templates, next_cursor} =
+      opts
+      |> mcp_action_resources()
+      |> Enum.filter(& &1.uri_template)
+      |> Enum.map(&resource_template_to_map/1)
+      |> Enum.sort_by(& &1["uriTemplate"])
+      |> page(& &1["uriTemplate"], params, opts)
+
+    maybe_put(%{"resourceTemplates" => templates}, "nextCursor", next_cursor)
+  end
+
+  # Keyset pagination over the deterministic list order: a cursor carries the
+  # key of the last entry served, so entries that appear or disappear between
+  # requests don't shift later pages. Without `list_page_size` every entry
+  # after the cursor is returned.
+  defp page(entries, key_fun, params, opts) do
+    entries =
+      case params do
+        %{"cursor" => cursor} when is_binary(cursor) ->
+          {:ok, after_key} = decode_cursor(cursor)
+          Enum.drop_while(entries, &(key_fun.(&1) <= after_key))
+
+        _ ->
+          entries
+      end
+
+    case Keyword.get(opts, :list_page_size) do
+      nil ->
+        {entries, nil}
+
+      size when is_integer(size) and size > 0 ->
+        case Enum.split(entries, size) do
+          {page, []} -> {page, nil}
+          {page, _rest} -> {page, page |> List.last() |> key_fun.() |> encode_cursor()}
+        end
+
+      other ->
+        raise ArgumentError,
+              "list_page_size must be a positive integer or nil, got: #{inspect(other)}"
+    end
+  end
+
+  defp encode_cursor(after_key) do
+    Base.url_encode64(Jason.encode!(%{"after" => after_key}), padding: false)
+  end
+
+  defp decode_cursor(cursor) when is_binary(cursor) do
+    with {:ok, json} <- Base.url_decode64(cursor, padding: false),
+         {:ok, %{"after" => after_key}} when is_binary(after_key) <- Jason.decode(json) do
+      {:ok, after_key}
+    else
+      _ -> :error
+    end
+  end
+
+  defp decode_cursor(_cursor), do: :error
+
   # Deterministic ordering per 2026-07-28 (enables client caching and
   # improves upstream LLM prompt-cache hit rates); harmless for older revisions.
-  defp tool_definitions(opts) do
+  defp listed_tools(opts) do
     opts
-    |> Keyword.take([:otp_app, :tools, :actor, :context, :tenant, :actions])
+    |> Keyword.take([:otp_app, :tools, :actor, :context, :tenant, :actions, :dev_tool_domains])
     |> Keyword.update(
       :context,
       %{otp_app: opts[:otp_app]},
       &Map.put(&1, :otp_app, opts[:otp_app])
     )
     |> tools()
-    |> Enum.map(fn %Tool{} = tool ->
-      # MCP schemas are advisory (no grammar-constrained sampling), so the
-      # OpenAI strict transformation defaults off here.
-      result = %{
+    |> Enum.sort_by(&to_string(&1.name))
+  end
+
+  defp tool_definition(%Tool{} = tool, opts) do
+    tool
+    |> base_tool_definition(opts)
+    |> transform_tool_definition(tool, opts)
+  end
+
+  defp transform_tool_definition(definition, tool, opts) do
+    case opts[:tool_definition_transformer] do
+      nil ->
+        definition
+
+      transformer when is_function(transformer, 3) ->
+        case transformer.(tool, definition, tool_context(opts)) do
+          %{} = transformed ->
+            transformed
+
+          other ->
+            raise ArgumentError,
+                  "tool_definition_transformer must return a map, got: #{inspect(other)}"
+        end
+
+      other ->
+        raise ArgumentError,
+              "tool_definition_transformer must be a three-arity function, got: #{inspect(other)}"
+    end
+  end
+
+  defp base_tool_definition(%Tool{} = tool, opts) do
+    # MCP schemas are advisory (no grammar-constrained sampling), so the
+    # OpenAI strict transformation defaults off here.
+    result =
+      %{
         "name" => to_string(tool.name),
         "description" => AshAi.Tools.description(tool),
         "inputSchema" =>
           AshAi.Tools.parameter_schema(tool, strict: Keyword.get(opts, :strict, false))
       }
+      |> maybe_put("title", tool.title)
+      |> maybe_put("annotations", tool_annotations(tool))
+      |> maybe_put("outputSchema", AshAi.Tool.OutputSchema.for_tool(tool))
 
-      result =
-        result
-        |> put_if("title", tool.title)
-        |> put_if("annotations", tool_annotations(tool.annotations))
-
-      if Tool.has_meta?(tool) do
-        Map.put(result, "_meta", tool._meta)
-      else
-        result
-      end
-    end)
-    |> Enum.sort_by(& &1["name"])
+    if Tool.has_meta?(tool) do
+      Map.put(result, "_meta", tool._meta)
+    else
+      result
+    end
   end
 
-  # The DSL schema restricts annotations to the MCP hint keys, so the
-  # camelCase conversion yields exactly readOnlyHint, destructiveHint, etc.
-  defp tool_annotations([_ | _] = annotations), do: keyword_to_camel_case_map(annotations)
-  defp tool_annotations(_annotations), do: nil
+  @tool_annotations [
+    :title,
+    :read_only_hint,
+    :destructive_hint,
+    :idempotent_hint,
+    :open_world_hint
+  ]
+
+  defp tool_annotations(%Tool{annotations: []}), do: nil
+
+  defp tool_annotations(%Tool{annotations: [_ | _] = annotations}) do
+    verify_annotations!(annotations)
+    keyword_to_camel_case_map(annotations)
+  end
+
+  defp verify_annotations!(annotations) do
+    with {:error, err} <- Keyword.validate(annotations, @tool_annotations) do
+      raise ArgumentError, "unrecognized tool annotation(s): #{inspect(err)}"
+    end
+  end
 
   defp resource_definitions(opts) do
     action_resources =
       opts
       |> mcp_action_resources()
+      |> Enum.reject(& &1.uri_template)
       |> Enum.map(&action_resource_to_map/1)
 
     ui_resources =
@@ -1033,26 +1352,55 @@ defmodule AshAi.Mcp.Server do
     Enum.sort_by(action_resources ++ ui_resources, & &1["uri"])
   end
 
-  defp execute_tool_call(params, session_id, opts) do
+  # 2025-06-18 types `structuredContent` as an object; 2026-07-28 allows any
+  # JSON value, so only that revision receives list results as structured content
+  # Each call runs in a `[:ash_ai, :mcp, :tool_call]` telemetry span (see
+  # `AshAi.Mcp.Router`), with the arguments as the client sent them, before
+  # `tool_argument_transformer`.
+  defp execute_tool_call(params, session_id, opts, call_opts \\ []) do
     tool_name = params["name"]
     tool_args = params["arguments"] || %{}
+    tool = find_tool_by_name(tool_name, session_id, opts)
+    context = tool_context(opts)
 
-    case find_tool_by_name(tool_name, session_id, opts) do
-      %Tool{} = tool ->
-        context = tool_context(opts)
+    metadata = %{
+      tool_name: tool_name,
+      tool: tool,
+      arguments: tool_args,
+      request_meta: params["_meta"],
+      session_id: session_id,
+      actor: context[:actor],
+      tenant: context[:tenant],
+      context: context[:context]
+    }
 
-        case transform_tool_arguments(tool, tool_args, context, opts) do
-          {:ok, transformed_args} ->
-            execute_resolved_tool(tool, transformed_args, context, opts)
+    :telemetry.span([:ash_ai, :mcp, :tool_call], metadata, fn ->
+      result = run_tool_call(tool, tool_args, context, opts, call_opts)
+      {result, Map.merge(metadata, tool_call_outcome(result))}
+    end)
+  end
 
-          {:error, error_text} ->
-            {:ok, tool_error_result(error_text)}
-        end
+  defp run_tool_call(nil, _tool_args, _context, _opts, _call_opts), do: {:error, :tool_not_found}
 
-      nil ->
-        {:error, :tool_not_found}
+  defp run_tool_call(%Tool{} = tool, tool_args, context, opts, call_opts) do
+    case transform_tool_arguments(tool, tool_args, context, opts) do
+      {:ok, transformed_args} ->
+        execute_resolved_tool(
+          tool,
+          transformed_args,
+          context,
+          Keyword.put(call_opts, :error_formatter, opts[:error_formatter])
+        )
+
+      {:error, error_text} ->
+        {:ok, tool_error_result(error_text)}
     end
   end
+
+  defp tool_call_outcome({:ok, result}),
+    do: %{result: result, is_error: result["isError"] == true, error: nil}
+
+  defp tool_call_outcome({:error, error}), do: %{result: nil, is_error: true, error: error}
 
   defp transform_tool_arguments(tool, arguments, context, opts) do
     case opts[:tool_argument_transformer] do
@@ -1078,26 +1426,36 @@ defmodule AshAi.Mcp.Server do
     end
   end
 
-  defp execute_resolved_tool(tool, arguments, context, opts) do
+  defp execute_resolved_tool(tool, arguments, context, call_opts) do
     case AshAi.Tools.execute(tool, arguments, context,
            encode?: false,
-           error_formatter: opts[:error_formatter]
+           error_formatter: call_opts[:error_formatter]
          ) do
-      {:ok, result, _} ->
+      {:ok, result, raw_result} ->
         case encode_tool_result(tool, result) do
           {:ok, encoded_result} ->
+            result_meta_context = %AshAi.Tool.ResultMeta.Context{
+              tool: tool,
+              arguments: arguments,
+              actor: context[:actor],
+              tenant: context[:tenant],
+              context: context[:context],
+              client_capabilities: call_opts[:client_capabilities]
+            }
+
             result =
               %{
                 "isError" => false,
                 "content" => [%{"type" => "text", "text" => encoded_result}]
               }
-              |> maybe_put_structured_content(result)
+              |> maybe_put_structured_content(
+                result,
+                encoded_result,
+                Keyword.get(call_opts, :structured_lists?, false)
+              )
+              |> put_result_meta(tool, raw_result, result_meta_context)
 
-            if Tool.has_meta?(tool) do
-              {:ok, Map.put(result, "_meta", tool._meta)}
-            else
-              {:ok, result}
-            end
+            {:ok, result}
 
           {:error, error_text} ->
             {:ok, tool_error_result(error_text)}
@@ -1108,6 +1466,23 @@ defmodule AshAi.Mcp.Server do
     end
   end
 
+  defp put_result_meta(result, tool, raw_result, context) do
+    meta =
+      deep_merge(
+        if(Tool.has_meta?(tool), do: tool._meta, else: %{}),
+        AshAi.Tool.ResultMeta.run(tool, raw_result, context)
+      )
+
+    if meta == %{}, do: result, else: Map.put(result, "_meta", meta)
+  end
+
+  defp deep_merge(left, right) do
+    Map.merge(left, right, fn
+      _key, %{} = left, %{} = right -> deep_merge(left, right)
+      _key, _left, right -> right
+    end)
+  end
+
   defp encode_tool_result(%{action: %{type: :action, returns: nil}}, result), do: {:ok, result}
 
   defp encode_tool_result(_tool, result) do
@@ -1116,11 +1491,19 @@ defmodule AshAi.Mcp.Server do
     error -> {:error, AshAi.Tool.Errors.format(error)}
   end
 
-  defp maybe_put_structured_content(result, structured_content)
+  # `is_map/1` also holds for structs such as DateTime, which Jason encodes as
+  # a string, so the encoded text decides whether the result is an object or
+  # an array
+  defp maybe_put_structured_content(result, structured_content, "{" <> _, _lists?)
        when is_map(structured_content),
        do: Map.put(result, "structuredContent", structured_content)
 
-  defp maybe_put_structured_content(result, _structured_content), do: result
+  defp maybe_put_structured_content(result, structured_content, "[" <> _, true)
+       when is_list(structured_content),
+       do: Map.put(result, "structuredContent", structured_content)
+
+  defp maybe_put_structured_content(result, _structured_content, _encoded, _lists?),
+    do: result
 
   defp tool_error_result(error_text) do
     %{
@@ -1138,57 +1521,58 @@ defmodule AshAi.Mcp.Server do
         &Map.put(&1, :mcp_session_id, session_id)
       )
 
-    with {:ok, resource} <- find_mcp_resource_by_uri(uri, opts),
-         {:ok, text} <- read_mcp_resource(resource, params, opts) do
-      mime_type =
-        case resource do
-          %AshAi.McpUiResource{} -> AshAi.McpUiResource.mime_type()
-          %AshAi.McpResource{mime_type: mt} -> mt
-        end
+    with {:ok, resource, variables} <- find_mcp_resource_by_uri(uri, opts) do
+      read_mcp_resource(resource, uri, variables, params, opts)
+    end
+  end
 
-      content =
-        %{"uri" => uri, "mimeType" => mime_type, "text" => text}
-        |> then(fn content ->
-          case resource do
-            %AshAi.McpUiResource{} = mcp_ui_resource ->
-              ui_meta = build_ui_meta(mcp_ui_resource, opts)
-              put_if(content, "_meta", if(ui_meta != %{}, do: %{"ui" => ui_meta}))
+  # A resource whose URI is exactly `uri` wins over a template matching it.
+  # Templates are tried in declaration order.
+  defp find_mcp_resource_by_uri(uri, opts) do
+    resources = mcp_resources(opts)
 
-            _ ->
-              content
-          end
+    case Enum.find(resources, &(not templated?(&1) and &1.uri == uri)) do
+      nil ->
+        Enum.find_value(resources, {:error, :not_found}, fn
+          %AshAi.McpResource{uri_template: %AshAi.Mcp.UriTemplate{} = template} = resource ->
+            case AshAi.Mcp.UriTemplate.match(template, uri) do
+              {:ok, variables} -> {:ok, resource, variables}
+              :error -> nil
+            end
+
+          _resource ->
+            nil
         end)
 
-      {:ok, content}
+      resource ->
+        {:ok, resource, %{}}
     end
   end
 
-  defp find_mcp_resource_by_uri(uri, opts) do
-    case Enum.find(mcp_resources(opts), &(&1.uri == uri)) do
-      nil -> {:error, :not_found}
-      resource -> {:ok, resource}
-    end
-  end
+  defp templated?(%AshAi.McpResource{uri_template: %AshAi.Mcp.UriTemplate{}}), do: true
+  defp templated?(_resource), do: false
 
-  # sobelow_skip ["Traversal.FileModule"]
-  # `html_path` is a developer-configured DSL value, not user-supplied input.
-  defp read_mcp_resource(%AshAi.McpUiResource{html_path: path}, _params, _opts) do
-    case File.read(path) do
-      {:ok, _contents} = ok -> ok
-      {:error, reason} -> {:error, "Failed to read file: #{inspect(reason)}"}
+  defp read_mcp_resource(%AshAi.McpUiResource{} = resource, uri, _variables, _params, opts) do
+    with {:ok, html} <- read_mcp_ui_html(resource) do
+      ui_meta = build_ui_meta(resource, opts)
+
+      content =
+        %{"uri" => uri, "mimeType" => AshAi.McpUiResource.mime_type(), "text" => html}
+        |> put_if("_meta", if(ui_meta != %{}, do: %{"ui" => ui_meta}))
+
+      {:ok, [content]}
     end
   end
 
   defp read_mcp_resource(
-         %AshAi.McpResource{
-           domain: _domain,
-           resource: resource,
-           action: action
-         },
+         %AshAi.McpResource{resource: resource, action: action} = mcp_resource,
+         uri,
+         variables,
          params,
          opts
        ) do
-    params = take_valid_params(params, action)
+    # Template variables win over request params of the same name
+    arguments = params |> take_valid_params(action) |> Map.merge(variables)
 
     ash_opts =
       Keyword.take(opts, [
@@ -1204,25 +1588,71 @@ defmodule AshAi.Mcp.Server do
       ])
 
     resource
-    |> Ash.ActionInput.for_action(action.name, params, ash_opts)
+    |> Ash.ActionInput.for_action(action.name, arguments, ash_opts)
     |> Ash.run_action()
     |> case do
-      {:error, error} ->
-        {:error, AshAi.Tool.Errors.format(error)}
+      {:ok, nil} ->
+        {:error, :not_found}
 
-      result ->
-        result
+      {:ok, result} ->
+        AshAi.McpResource.Contents.run(mcp_resource, result, %AshAi.McpResource.Contents.Context{
+          mcp_resource: mcp_resource,
+          uri: uri,
+          arguments: arguments,
+          actor: opts[:actor],
+          tenant: opts[:tenant],
+          context: opts[:context]
+        })
+
+      {:error, error} ->
+        if not_found_error?(error),
+          do: {:error, :not_found},
+          else: {:error, AshAi.Tool.Errors.format(error)}
+    end
+  end
+
+  defp read_mcp_ui_html(%AshAi.McpUiResource{html: {module, function, args}}) do
+    case apply(module, function, args) do
+      html when is_binary(html) -> {:ok, html}
+      {:error, message} when is_binary(message) -> {:error, message}
+      _ -> {:error, "MCP UI HTML renderer must return a string or {:error, message}."}
+    end
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  # `html_path` is a developer-configured DSL value, not user-supplied input.
+  defp read_mcp_ui_html(%AshAi.McpUiResource{html_path: path}) do
+    case File.read(path) do
+      {:ok, _contents} = ok -> ok
+      {:error, reason} -> {:error, "Failed to read file: #{inspect(reason)}"}
+    end
+  end
+
+  defp not_found_error?(error) do
+    case Ash.Error.to_error_class(error) do
+      %{errors: errors} -> Enum.any?(errors, &match?(%Ash.Error.Query.NotFound{}, &1))
+      _error -> false
     end
   end
 
   defp action_resource_to_map(%AshAi.McpResource{} = resource) do
     %{
       "name" => Atom.to_string(resource.name),
-      "description" => resource.description,
       "uri" => resource.uri,
-      "title" => resource.title,
-      "mimeType" => resource.mime_type
+      "title" => resource.title
     }
+    |> put_if("mimeType", resource.mime_type)
+    |> put_if("description", resource.description)
+  end
+
+  defp resource_template_to_map(%AshAi.McpResource{} = resource) do
+    %{
+      "name" => Atom.to_string(resource.name),
+      "uriTemplate" => resource.uri,
+      "title" => resource.title
+    }
+    |> put_if("mimeType", resource.mime_type)
+    |> put_if("description", resource.description)
   end
 
   defp ui_resource_to_map(%AshAi.McpUiResource{} = resource, opts) do
@@ -1340,7 +1770,7 @@ defmodule AshAi.Mcp.Server do
 
   defp find_tool_by_name(tool_name, session_id, opts) do
     opts
-    |> Keyword.take([:otp_app, :tools, :actor, :context, :tenant, :actions])
+    |> Keyword.take([:otp_app, :tools, :actor, :context, :tenant, :actions, :dev_tool_domains])
     |> Keyword.update(
       :context,
       %{mcp_session_id: session_id},
@@ -1374,14 +1804,11 @@ defmodule AshAi.Mcp.Server do
   defp tools(opts) do
     opts =
       if opts[:tools] == :ash_dev_tools do
+        dev_tools = AshAi.Mcp.Dev.dev_tools(opts[:dev_tool_domains] || [])
+
         opts
-        |> Keyword.put(:actions, [{AshAi.DevTools.Tools, :*}])
-        |> Keyword.put(:tools, [
-          :list_ash_resources,
-          :list_generators,
-          :get_usage_rules,
-          :list_packages_with_rules
-        ])
+        |> Keyword.put(:actions, dev_tools |> Enum.map(&{&1.resource, :*}) |> Enum.uniq())
+        |> Keyword.put(:tools, dev_tools |> Enum.map(& &1.name) |> Enum.uniq())
       else
         opts
       end
@@ -1419,14 +1846,11 @@ defmodule AshAi.Mcp.Server do
   @doc """
   Create a standard JSON-RPC error response
   """
+  @deprecated "Always includes an id, which 2025-11-25 and later omit when the request id is unknown"
   def json_rpc_error_response(id, code, message, data \\ nil) do
-    error = %{"code" => code, "message" => message}
-    error = if data, do: Map.put(error, "data", data), else: error
-
-    Jason.encode!(%{
-      "jsonrpc" => "2.0",
-      "id" => id,
-      "error" => error
-    })
+    code
+    |> error_payload(message, data)
+    |> Map.put("id", id)
+    |> Jason.encode!()
   end
 end

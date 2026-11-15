@@ -52,6 +52,14 @@ tool :update_artist, Artist, :update, identity: :id, load: [:albums]
 ```
 
 ```
+tool :update_artist, Artist, :update, read_action: :read_in_scope
+```
+
+```
+tool :delete_artist, Artist, :destroy, title: "Delete artist", annotations: [destructive_hint: true, idempotent_hint: true]
+```
+
+```
 tool :list_artists, Artist, :read, load: [albums: [:title]], load_strict?: true
 ```
 
@@ -77,7 +85,7 @@ tool :list_artists, Artist, :read, ui: "ui://artists/list.html"
 ```
 
 ```
-tool :list_artists, Artist, :read, title: "List artists", annotations: [read_only_hint: true, open_world_hint: false]
+tool :artist_chart, Artist, :read, ui: :artist_chart, result_meta: &MyAppWeb.McpViews.artist_chart/2
 ```
 
 
@@ -94,19 +102,26 @@ tool :list_artists, Artist, :read, title: "List artists", annotations: [read_onl
 | Name | Type | Default | Docs |
 |------|------|---------|------|
 | [`action_parameters`](#tools-tool-action_parameters){: #tools-tool-action_parameters } | `list(atom \| {:result_type, list(:run_query \| :count \| :exists \| :aggregate)})` |  | A list of action specific parameters to allow for the underlying action. Only relevant for reads, and defaults to allowing `[:sort, :offset, :limit, :result_type, :filter]`. Paginated actions always expose their page controls (`offset`, and/or `after`/`before` keyset cursors) regardless of this list, since the returned page hands back the value to pass for the next page. `:result_type` may also be given as `result_type: [:count]` to restrict which result types are offered; `:run_query` is always included. |
+| [`filterable_fields`](#tools-tool-filterable_fields){: #tools-tool-filterable_fields } | `list(atom)` |  | For read tools, the fields the tool may filter on. Defaults to every public, filterable attribute, calculation and aggregate. Narrowing the list keeps the tool definition small on wide resources; filters on any other field are refused. An empty list removes the `filter` parameter. |
+| [`sortable_fields`](#tools-tool-sortable_fields){: #tools-tool-sortable_fields } | `list(atom)` |  | For read tools, the fields the tool may sort on. Defaults to every public, sortable attribute, calculation and aggregate. Sorts on any other field are refused. An empty list removes the `sort` parameter. |
+| [`aggregatable_fields`](#tools-tool-aggregatable_fields){: #tools-tool-aggregatable_fields } | `list(atom)` |  | For read tools, the fields the tool may aggregate with `result_type`. Defaults to every public attribute, calculation and aggregate. Aggregates of any other field are refused. An empty list removes the aggregate result type. |
 | [`full_filter_schema?`](#tools-tool-full_filter_schema?){: #tools-tool-full_filter_schema? } | `boolean` | `false` | Whether to generate the full JSON schema for the `filter` parameter of read actions. When `false` (the default), the filter is a free-form object whose shape is explained in the parameter description, keeping the tool definition much smaller. Set to `true` when you need a fully-specified schema, e.g. for strict/grammar-constrained tool calling. |
 | [`top_level_arguments?`](#tools-tool-top_level_arguments?){: #tools-tool-top_level_arguments? } | `boolean` | `false` | Whether to publish the action's arguments, and the tool's own arguments, at the root of the tool's input schema instead of under an `input` object. Calls then pass the arguments at the root too. Only supported on generic action tools. Use this when a client contract reads top-level fields, such as OpenAI's `search` and `fetch` tools or `openai/fileParams`. |
+| [`output_schema?`](#tools-tool-output_schema?){: #tools-tool-output_schema? } | `boolean` | `false` | Whether to publish an MCP `outputSchema` describing the tool's structured result. Supported for generic actions that return an object (a map, struct, typed struct or resource) with `allow_nil? false`, for read tools with `get_by`, and for create, update and destroy tools. Requires a static `load` list. The schema is derived from the result's type and is never stricter than what the tool returns, since clients reject results that don't match it. |
+| [`compact_field_list?`](#tools-tool-compact_field_list?){: #tools-tool-compact_field_list? } | `boolean` | `false` | For read tools, whether to list the names of the fields that can be filtered, sorted and aggregated once, in the schema description, instead of in the `filter` description and the `sort` and aggregate `field` enums. Keeps the tool definition much smaller on wide resources. Has no effect with `full_filter_schema?: true`, which keeps every list. |
 | [`load`](#tools-tool-load){: #tools-tool-load } | `any` | `[]` | A list of relationships and calculations to load, or an anonymous function/1. Note that loaded fields can include private attributes, which will then be included in the tool's response. However, private attributes cannot be used for filtering, sorting, or aggregation. If a function is provided, it will be called with the tool input (a Map with **String keys**) and must return the final load list, e.g. `load fn input -> [schedule: [date: input["date"]]] end` (use string keys!). |
 | [`load_strict?`](#tools-tool-load_strict?){: #tools-tool-load_strict? } | `boolean` | `false` | Whether to apply the `load` statement strictly. When `true`, only the fields listed for a relationship in `load` are selected on that relationship, rather than all of its public attributes. This keeps tool responses (and the underlying queries) smaller when you only need a few fields of a related record. Note that with `load_strict?: true` you must list every field you want alongside any nested relationships, e.g. `load: [:title, category: [:name]]`. |
 | [`select`](#tools-tool-select){: #tools-tool-select } | `list(atom)` |  | A list of attributes to return for the tool's resource. When set, only these attributes are read and included in the tool's response, instead of all public attributes. Private attributes may be listed here, which will then be included in the response. Note that private attributes still cannot be used for filtering, sorting, or aggregation. Fields listed in `load` are included in the response in addition to those listed here. |
 | [`async`](#tools-tool-async){: #tools-tool-async } | `boolean` | `true` |  |
 | [`description`](#tools-tool-description){: #tools-tool-description } | `String.t` |  | A description for the tool. Defaults to the action's description. |
-| [`title`](#tools-tool-title){: #tools-tool-title } | `String.t` |  | A human-readable display name for the tool, emitted as the MCP `title`. Omitted from `tools/list` when unset. |
-| [`annotations`](#tools-tool-annotations){: #tools-tool-annotations } | `keyword` |  | MCP tool annotation hints. Only the hints given are emitted; `tools/list` omits `annotations` when none are set. |
 | [`identity`](#tools-tool-identity){: #tools-tool-identity } | `atom` |  | The identity to use for update/destroy actions. Defaults to the primary key. Set to `false` to disable entirely. |
+| [`read_action`](#tools-tool-read_action){: #tools-tool-read_action } | `atom` |  | For update/destroy actions, the read action used to find the record. Its filters, preparations and policies apply to the lookup, so a record it cannot see is reported as not found. Defaults to the action's `atomic_upgrade_with`, or the primary read action. |
 | [`get_by`](#tools-tool-get_by){: #tools-tool-get_by } | `atom \| list(atom)` |  | For read actions, a field or list of fields used to fetch a single record. The fields must be filterable attributes, calculations or aggregates. |
+| [`title`](#tools-tool-title){: #tools-tool-title } | `String.t` |  | A short, human-readable name for the tool (MCP `title`). Clients show it instead of the tool's identifier, for example in a confirmation prompt. |
+| [`annotations`](#tools-tool-annotations){: #tools-tool-annotations } | `keyword` | `[]` | MCP tool annotations: an optional `title` and the hints a client uses to decide whether to ask the person before a call and how to present the tool. The MCP specification treats the hints as untrusted, not as security guarantees. Only what you set is sent, so the client applies its own defaults to the rest. |
 | [`_meta`](#tools-tool-_meta){: #tools-tool-_meta } | `any` | `%{}` | Optional metadata map for tool integrations. Supports provider-specific extensions like OpenAI metadata. Keys and values should be strings to comply with JSON-RPC serialization. |
 | [`ui`](#tools-tool-ui){: #tools-tool-ui } | `atom \| String.t` |  | The `mcp_ui_resource` name (atom) or a `ui://` URI string for MCP Apps. Shortcut for setting `_meta.ui.resourceUri`. When an atom is given, the URI is resolved from the matching `mcp_ui_resource` declaration. |
+| [`result_meta`](#tools-tool-result_meta){: #tools-tool-result_meta } | `(any, any -> any) \| module` |  | Per-call `_meta` for the tool's MCP `tools/call` result, for data the tool's view needs but the model shouldn't read. A module implementing `AshAi.Tool.ResultMeta`, or a function taking the action's unserialized result and an `AshAi.Tool.ResultMeta.Context` and returning a map or `nil`. The map is deep-merged over `_meta`. See `AshAi.Tool.ResultMeta`. |
 
 
 ### tools.tool.argument
@@ -126,7 +141,7 @@ An argument to be passed to the tool.
 | Name | Type | Default | Docs |
 |------|------|---------|------|
 | [`name`](#tools-tool-argument-name){: #tools-tool-argument-name .spark-required} | `atom` |  | The name of the argument. |
-| [`type`](#tools-tool-argument-type){: #tools-tool-argument-type .spark-required} | `any` |  | The Ash type of the argument (e.g., :string, :date, :integer). |
+| [`type`](#tools-tool-argument-type){: #tools-tool-argument-type .spark-required} | `module` |  | The Ash type of the argument (e.g., :string, :date, :integer). |
 ### Options
 
 | Name | Type | Default | Docs |
@@ -245,6 +260,10 @@ mcp_resource :artist_card, "file://ui/artist_card.html", Artist, :artist_card, m
 mcp_resource :artist_data, "file://data/artist.json", Artist, :to_json, description: "Artist metadata as JSON", mime_type: "application/json"
 ```
 
+```
+mcp_resource :artist_photo, "artists://{id}/photo", Artist, :photo, contents: &MyAppWeb.McpViews.artist_photo/2
+```
+
 
 
 ### Arguments
@@ -252,7 +271,7 @@ mcp_resource :artist_data, "file://data/artist.json", Artist, :to_json, descript
 | Name | Type | Default | Docs |
 |------|------|---------|------|
 | [`name`](#mcp_resources-mcp_resource-name){: #mcp_resources-mcp_resource-name .spark-required} | `atom` |  |  |
-| [`uri`](#mcp_resources-mcp_resource-uri){: #mcp_resources-mcp_resource-uri .spark-required} | `String.t` |  | The URI where the resource can be accessed. |
+| [`uri`](#mcp_resources-mcp_resource-uri){: #mcp_resources-mcp_resource-uri .spark-required} | `String.t` |  | The URI where the resource can be accessed, or an RFC 6570 URI template such as `"photos://{id}"` whose variables are passed to the action as arguments. Templates support `{var}`, `{+var}` and a trailing `{?var,...}`. See `AshAi.McpResource`. |
 | [`resource`](#mcp_resources-mcp_resource-resource){: #mcp_resources-mcp_resource-resource .spark-required} | `module` |  |  |
 | [`action`](#mcp_resources-mcp_resource-action){: #mcp_resources-mcp_resource-action .spark-required} | `atom` |  |  |
 ### Options
@@ -261,7 +280,8 @@ mcp_resource :artist_data, "file://data/artist.json", Artist, :to_json, descript
 |------|------|---------|------|
 | [`title`](#mcp_resources-mcp_resource-title){: #mcp_resources-mcp_resource-title .spark-required} | `String.t` |  | A short, human-readable title for the resource. |
 | [`description`](#mcp_resources-mcp_resource-description){: #mcp_resources-mcp_resource-description } | `String.t` |  | A description of the resource. This is important for LLM to determine what the resource is and when to call it. Defaults to the Action's description if not provided. |
-| [`mime_type`](#mcp_resources-mcp_resource-mime_type){: #mcp_resources-mcp_resource-mime_type } | `String.t` | `"text/plain"` | The MIME type of the resource, e.g. 'application/json', 'image/png', etc. |
+| [`mime_type`](#mcp_resources-mcp_resource-mime_type){: #mcp_resources-mcp_resource-mime_type } | `String.t` |  | The MIME type of the resource, e.g. 'application/json', 'image/png', etc. Defaults to `text/plain` for an action returning `:string`, and `application/octet-stream` for one returning `:binary`. With `contents` there is no default, since each read's items can carry their own. |
+| [`contents`](#mcp_resources-mcp_resource-contents){: #mcp_resources-mcp_resource-contents } | `(any, any -> any) \| module` |  | Builds the `resources/read` contents from the action's result, for binary data with a MIME type that differs per read, or several items. A module implementing `AshAi.McpResource.Contents`, or a function taking the action's result and an `AshAi.McpResource.Contents.Context` and returning items built with `AshAi.McpResource.Contents.text/2` or `blob/2`. With it, the action may return any type. |
 
 
 
@@ -277,7 +297,7 @@ mcp_ui_resource name, uri
 ```
 
 
-A UI resource for MCP Apps — serves a static HTML file that is rendered in a sandboxed
+A UI resource for MCP Apps — serves HTML from a file or callback, rendered in a sandboxed
 iframe by MCP hosts (like Claude Desktop). Link tools to UI resources using the tool's
 `ui:` option or `_meta.ui.resourceUri`.
 
@@ -307,7 +327,8 @@ mcp_ui_resource :artist_dashboard, "ui://artists/dashboard.html", html_path: "pr
 
 | Name | Type | Default | Docs |
 |------|------|---------|------|
-| [`html_path`](#mcp_resources-mcp_ui_resource-html_path){: #mcp_resources-mcp_ui_resource-html_path .spark-required} | `String.t` |  | Path to the HTML file on disk. Read at request time. |
+| [`html_path`](#mcp_resources-mcp_ui_resource-html_path){: #mcp_resources-mcp_ui_resource-html_path } | `String.t` |  | Path to the HTML file on disk. Read at request time. Mutually exclusive with `html`. |
+| [`html`](#mcp_resources-mcp_ui_resource-html){: #mcp_resources-mcp_ui_resource-html } | `mfa` |  | MFA invoked at request time to render HTML. Must return a string or `{:error, message}`. Only the configured arguments are passed. Mutually exclusive with `html_path`. |
 | [`title`](#mcp_resources-mcp_ui_resource-title){: #mcp_resources-mcp_ui_resource-title } | `String.t` |  | A short, human-readable title. Defaults to the resource name. |
 | [`description`](#mcp_resources-mcp_ui_resource-description){: #mcp_resources-mcp_ui_resource-description } | `String.t` |  | A description of the UI resource. |
 | [`csp`](#mcp_resources-mcp_ui_resource-csp){: #mcp_resources-mcp_ui_resource-csp } | `keyword` |  | Content Security Policy configuration. |

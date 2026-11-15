@@ -167,6 +167,7 @@ defmodule AshAi.Mcp.ToolsTest do
     test "capabilities include tools" do
       init_response =
         conn(:post, "/", %{
+          "jsonrpc" => "2.0",
           "method" => "initialize",
           "id" => "init_1",
           "params" => %{"client" => %{"name" => "test_client", "version" => "1.0.0"}}
@@ -181,7 +182,12 @@ defmodule AshAi.Mcp.ToolsTest do
 
     test "omits `instructions` when not configured" do
       init_response =
-        conn(:post, "/", %{"method" => "initialize", "id" => "init_1", "params" => %{}})
+        conn(:post, "/", %{
+          "jsonrpc" => "2.0",
+          "method" => "initialize",
+          "id" => "init_1",
+          "params" => %{}
+        })
         |> Router.call(@opts)
 
       init_body = decode_response(init_response)
@@ -192,7 +198,12 @@ defmodule AshAi.Mcp.ToolsTest do
       opts = Router.init(Keyword.put(@opts, :instructions, "Server-level guidance."))
 
       init_response =
-        conn(:post, "/", %{"method" => "initialize", "id" => "init_1", "params" => %{}})
+        conn(:post, "/", %{
+          "jsonrpc" => "2.0",
+          "method" => "initialize",
+          "id" => "init_1",
+          "params" => %{}
+        })
         |> Router.call(opts)
 
       init_body = decode_response(init_response)
@@ -206,11 +217,78 @@ defmodule AshAi.Mcp.ToolsTest do
         )
 
       init_response =
-        conn(:post, "/", %{"method" => "initialize", "id" => "init_1", "params" => %{}})
+        conn(:post, "/", %{
+          "jsonrpc" => "2.0",
+          "method" => "initialize",
+          "id" => "init_1",
+          "params" => %{}
+        })
         |> Router.call(opts)
 
       init_body = decode_response(init_response)
       assert init_body["result"]["instructions"] == "tools=1"
+    end
+
+    test "omits `icons` from serverInfo when not configured" do
+      init_response =
+        conn(:post, "/", %{
+          "jsonrpc" => "2.0",
+          "method" => "initialize",
+          "id" => "init_1",
+          "params" => %{}
+        })
+        |> Router.call(@opts)
+
+      init_body = decode_response(init_response)
+      refute Map.has_key?(init_body["result"]["serverInfo"], "icons")
+    end
+
+    test "includes `icons` in serverInfo from opts" do
+      icons = [
+        %{
+          "src" => "https://example.com/icon.png",
+          "mimeType" => "image/png",
+          "sizes" => ["512x512"]
+        }
+      ]
+
+      opts = Router.init(Keyword.put(@opts, :mcp_icons, icons))
+
+      init_response =
+        conn(:post, "/", %{
+          "jsonrpc" => "2.0",
+          "method" => "initialize",
+          "id" => "init_1",
+          "params" => %{}
+        })
+        |> Router.call(opts)
+
+      init_body = decode_response(init_response)
+      assert init_body["result"]["serverInfo"]["icons"] == icons
+    end
+
+    test "supports a 1-arity function for `icons`" do
+      opts =
+        Router.init(
+          Keyword.put(@opts, :mcp_icons, fn opts ->
+            [%{src: "https://example.com/#{opts[:otp_app]}.svg", sizes: ["any"]}]
+          end)
+        )
+
+      init_response =
+        conn(:post, "/", %{
+          "jsonrpc" => "2.0",
+          "method" => "initialize",
+          "id" => "init_1",
+          "params" => %{}
+        })
+        |> Router.call(opts)
+
+      init_body = decode_response(init_response)
+
+      assert init_body["result"]["serverInfo"]["icons"] == [
+               %{"src" => "https://example.com/ash_ai.svg", "sizes" => ["any"]}
+             ]
     end
   end
 
@@ -219,6 +297,7 @@ defmodule AshAi.Mcp.ToolsTest do
       # Step 1: Initialize
       init_response =
         conn(:post, "/", %{
+          "jsonrpc" => "2.0",
           "method" => "initialize",
           "id" => "init_1",
           "params" => %{"client" => %{"name" => "test_client", "version" => "1.0.0"}}
@@ -263,6 +342,7 @@ defmodule AshAi.Mcp.ToolsTest do
   defp initialize_and_get_session_id(opts) do
     response =
       conn(:post, "/", %{
+        "jsonrpc" => "2.0",
         "method" => "initialize",
         "id" => "init_1",
         "params" => %{"client" => %{"name" => "test_client", "version" => "1.0.0"}}
@@ -273,7 +353,7 @@ defmodule AshAi.Mcp.ToolsTest do
   end
 
   defp list_tools(session_id, opts) do
-    conn(:post, "/", %{"method" => "tools/list", "id" => "list_1"})
+    conn(:post, "/", %{"jsonrpc" => "2.0", "method" => "tools/list", "id" => "list_1"})
     |> put_req_header("mcp-session-id", session_id)
     |> Router.call(opts)
   end
@@ -281,7 +361,12 @@ defmodule AshAi.Mcp.ToolsTest do
   defp call_tool(session_id, tool_name, params, opts) do
     request_params = Map.put(params, "name", tool_name)
 
-    conn(:post, "/", %{"method" => "tools/call", "id" => "call_1", "params" => request_params})
+    conn(:post, "/", %{
+      "jsonrpc" => "2.0",
+      "method" => "tools/call",
+      "id" => "call_1",
+      "params" => request_params
+    })
     |> put_req_header("mcp-session-id", session_id)
     |> Router.call(opts)
   end
