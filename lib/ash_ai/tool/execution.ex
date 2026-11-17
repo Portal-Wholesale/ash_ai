@@ -22,6 +22,9 @@ defmodule AshAi.Tool.Execution do
       :load,
       :select,
       :domain,
+      :filterable_fields,
+      :sortable_fields,
+      :aggregatable_fields,
       encode?: true,
       load_strict?: false
     ]
@@ -47,9 +50,10 @@ defmodule AshAi.Tool.Execution do
           select: select,
           identity: identity,
           get_by: get_by,
+          read_action: read_action,
           arguments: tool_arguments,
           top_level_arguments?: top_level_arguments?
-        },
+        } = tool,
         client_arguments,
         context,
         run_opts \\ []
@@ -75,6 +79,9 @@ defmodule AshAi.Tool.Execution do
         load_strict?: load_strict?,
         select: select,
         domain: domain,
+        filterable_fields: tool.filterable_fields,
+        sortable_fields: tool.sortable_fields,
+        aggregatable_fields: tool.aggregatable_fields,
         encode?: Keyword.get(run_opts, :encode?, true)
       }
 
@@ -90,10 +97,10 @@ defmodule AshAi.Tool.Execution do
             run_create(resource, action, input, opts, exec_ctx)
 
           :update ->
-            run_update(resource, action, arguments, input, opts, identity, exec_ctx)
+            run_update(resource, action, arguments, input, opts, identity, read_action, exec_ctx)
 
           :destroy ->
-            run_destroy(resource, action, arguments, input, opts, identity, exec_ctx)
+            run_destroy(resource, action, arguments, input, opts, identity, read_action, exec_ctx)
 
           :action ->
             run_generic(resource, action, input, opts, exec_ctx)
@@ -121,6 +128,9 @@ defmodule AshAi.Tool.Execution do
   defp serialize_opts(ctx), do: [load: ctx.load, select: ctx.select]
 
   defp run_read(resource, action, arguments, input, opts, nil, ctx) do
+    ensure_allowed_fields!(ctx.filterable_fields, filter_fields(arguments["filter"]), "filter on")
+    ensure_allowed_fields!(ctx.sortable_fields, sort_fields(arguments["sort"]), "sort on")
+
     sort = build_sort(arguments["sort"])
     limit = build_limit(arguments["limit"], action.pagination)
 
@@ -133,7 +143,12 @@ defmodule AshAi.Tool.Execution do
       |> apply_select(ctx)
       |> Ash.Query.for_read(action.name, input, opts)
 
-    page_opts = build_page_opts(action.pagination, limit, arguments)
+    page_opts =
+      build_page_opts(
+        action.pagination,
+        query.limit || limit,
+        Map.put(arguments, "offset", query.offset)
+      )
 
     execute_read(query, action, arguments["result_type"] || "run_query", page_opts, ctx)
   end
@@ -164,6 +179,48 @@ defmodule AshAi.Tool.Execution do
   end
 
   defp build_sort(_), do: ""
+
+  # A tool's `filterable_fields`, `sortable_fields` and `aggregatable_fields` narrow
+  # what its schema offers; requests naming any other field are refused rather
+  # than quietly honored
+  defp ensure_allowed_fields!(nil, _requested, _use), do: :ok
+
+  defp ensure_allowed_fields!(allowed, requested, use) do
+    allowed_names = Enum.map(allowed, &to_string/1)
+
+    case Enum.reject(requested, &(to_string(&1) in allowed_names)) do
+      [] ->
+        :ok
+
+      [field | _] ->
+        throw(
+          {:tool_error,
+           "Cannot #{use} `#{field}`. Allowed fields: #{Enum.join(allowed_names, ", ")}"}
+        )
+    end
+  end
+
+  defp sort_fields(sort) when is_list(sort) do
+    for %{"field" => field} <- sort, do: field
+  end
+
+  defp sort_fields(_sort), do: []
+
+  # Accepts both the documented condition form and Ash's native filter input,
+  # which the filter parameter also passes through to `Ash.Query.filter_input/2`
+  defp filter_fields(conditions) when is_list(conditions),
+    do: Enum.flat_map(conditions, &filter_fields/1)
+
+  defp filter_fields(%{"field" => field, "operator" => _, "value" => _}), do: [field]
+
+  defp filter_fields(filter) when is_map(filter) do
+    Enum.flat_map(filter, fn
+      {combinator, nested} when combinator in ["and", "or", "not"] -> filter_fields(nested)
+      {field, _condition} -> [field]
+    end)
+  end
+
+  defp filter_fields(_filter), do: []
 
   defp build_limit(limit, pagination) do
     case {limit, pagination} do
@@ -245,6 +302,22 @@ defmodule AshAi.Tool.Execution do
   defp put_select(opts, %Context{select: nil}), do: opts
   defp put_select(opts, %Context{select: select}), do: Keyword.put(opts, :select, select)
 
+  defp write_load(resource, %Context{load_strict?: true, load: load})
+       when load not in [nil, []] do
+    strict_loads = Ash.Query.load(resource, load, strict?: true).load
+
+    load
+    |> List.wrap()
+    |> Enum.reject(&Keyword.has_key?(strict_loads, load_name(&1)))
+    |> Enum.concat(strict_loads)
+  end
+
+  defp write_load(_resource, %Context{load: load}), do: load
+
+  defp load_name({name, _}) when is_atom(name), do: name
+  defp load_name(name) when is_atom(name), do: name
+  defp load_name(_), do: nil
+
   defp apply_filter(query, nil), do: query
   defp apply_filter(query, []), do: query
   defp apply_filter(query, filter) when is_map(filter) and map_size(filter) == 0, do: query
@@ -280,13 +353,7 @@ defmodule AshAi.Tool.Execution do
   # counts automatically).
   defp execute_read(query, _action, "run_query", page_opts, ctx) when is_list(page_opts) do
     query
-    |> Ash.Query.unset([:limit, :offset])
-    |> Ash.Query.page(page_opts)
-    |> Ash.read(load: ctx.load, strict?: ctx.load_strict?)
-    |> case do
-      {:ok, %struct{} = page} when struct in [Ash.Page.Offset, Ash.Page.Keyset] -> page
-      {:error, error} -> raise Ash.Error.to_error_class(error)
-    end
+    |> read_page(page_opts, ctx)
     |> as_requested_page(page_opts)
     |> then(fn page ->
       page
@@ -355,6 +422,8 @@ defmodule AshAi.Tool.Execution do
       raise "missing field argument"
     end
 
+    ensure_allowed_fields!(ctx.aggregatable_fields, [aggregate["field"]], "aggregate")
+
     field = Ash.Resource.Info.field(resource, aggregate["field"])
 
     if !field || !field.public? do
@@ -362,13 +431,10 @@ defmodule AshAi.Tool.Execution do
     end
 
     aggregate_kind = String.to_existing_atom(aggregate_kind)
+    {field_type, field_constraints} = lookup_field_type(resource, aggregate["field"])
 
     {:ok, aggregate_type, aggregate_constraints} =
-      Ash.Query.Aggregate.kind_to_type(
-        aggregate_kind,
-        field.type,
-        field.constraints || []
-      )
+      Ash.Query.Aggregate.kind_to_type(aggregate_kind, field_type, field_constraints)
 
     query
     |> Ash.Query.unset([:limit, :offset])
@@ -407,6 +473,23 @@ defmodule AshAi.Tool.Execution do
   # paginates by keyset but wraps the result according to the global
   # `config :ash, :default_page_type` (offset unless configured). The tool asked
   # for keyset, so rebuild the page as one; the records already carry keysets.
+  defp read_page(query, page_opts, ctx) do
+    if page_opts[:limit] == 0,
+      do: %Ash.Page.Offset{results: [], limit: 0, offset: page_opts[:offset] || 0, more?: false},
+      else: run_page(query, page_opts, ctx)
+  end
+
+  defp run_page(query, page_opts, ctx) do
+    query
+    |> Ash.Query.unset([:limit, :offset])
+    |> Ash.Query.page(page_opts)
+    |> Ash.read(load: ctx.load, strict?: ctx.load_strict?)
+    |> case do
+      {:ok, %struct{} = page} when struct in [Ash.Page.Offset, Ash.Page.Keyset] -> page
+      {:error, error} -> raise Ash.Error.to_error_class(error)
+    end
+  end
+
   defp as_requested_page(%Ash.Page.Offset{} = page, page_opts) do
     if Keyword.has_key?(page_opts, :offset) do
       page
@@ -476,11 +559,11 @@ defmodule AshAi.Tool.Execution do
     resource
     |> Ash.Changeset.for_create(action.name, input, opts)
     |> apply_changeset_select(ctx)
-    |> Ash.create!(load: ctx.load)
+    |> Ash.create!(load: write_load(resource, ctx))
     |> serialize_record(resource, ctx)
   end
 
-  defp run_update(resource, action, arguments, input, opts, identity, ctx) do
+  defp run_update(resource, action, arguments, input, opts, identity, read_action, ctx) do
     filter = identity_filter(identity, resource, arguments)
 
     resource
@@ -492,8 +575,9 @@ defmodule AshAi.Tool.Execution do
       Keyword.merge(opts,
         return_errors?: true,
         notify?: true,
+        read_action: read_action,
         strategy: [:atomic, :stream, :atomic_batches],
-        load: ctx.load,
+        load: write_load(resource, ctx),
         allow_stream_with: :full_read,
         return_records?: true
       )
@@ -508,7 +592,7 @@ defmodule AshAi.Tool.Execution do
     end
   end
 
-  defp run_destroy(resource, action, arguments, input, opts, identity, ctx) do
+  defp run_destroy(resource, action, arguments, input, opts, identity, read_action, ctx) do
     filter = identity_filter(identity, resource, arguments)
 
     resource
@@ -520,7 +604,8 @@ defmodule AshAi.Tool.Execution do
       Keyword.merge(opts,
         return_errors?: true,
         notify?: true,
-        load: ctx.load,
+        read_action: read_action,
+        load: write_load(resource, ctx),
         strategy: [:atomic, :stream, :atomic_batches],
         allow_stream_with: :full_read,
         return_records?: true
@@ -592,9 +677,10 @@ defmodule AshAi.Tool.Execution do
   end
 
   defp identity_value(resource, key, arguments) do
-    arguments
-    |> Map.get(to_string(key))
-    |> then(&cast_lookup_value!(resource, key, &1, "identity"))
+    case Map.get(arguments, to_string(key)) do
+      nil -> throw({:tool_error, "Missing required identity argument: #{key}"})
+      value -> cast_lookup_value!(resource, key, value, "identity")
+    end
   end
 
   defp get_by_filter(resource, get_by, arguments) do
@@ -610,9 +696,6 @@ defmodule AshAi.Tool.Execution do
 
   # Values arrive as JSON primitives, so they are cast to the field's type before
   # filtering. Mirrors what `Ash.CodeInterface` does for `get_by` code interfaces.
-  # A missing argument stays `nil` here, so the caller decides how to handle it.
-  defp cast_lookup_value!(_resource, _field_name, nil, _label), do: nil
-
   defp cast_lookup_value!(resource, field_name, value, label) do
     {type, constraints} = lookup_field_type(resource, field_name)
 

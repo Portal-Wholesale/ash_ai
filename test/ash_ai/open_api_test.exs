@@ -5,7 +5,7 @@
 defmodule AshAi.OpenApiTest do
   use ExUnit.Case, async: true
 
-  alias __MODULE__.{Music, Artist, Album}
+  alias __MODULE__.{Music, Artist, Album, Profile}
 
   defmodule Bio do
     use Ash.Resource, data_layer: :embedded
@@ -149,6 +149,98 @@ defmodule AshAi.OpenApiTest do
     end
   end
 
+  defmodule Event do
+    use Ash.Resource,
+      domain: Music,
+      data_layer: Ash.DataLayer.Ets
+
+    ets do
+      private? true
+    end
+
+    attributes do
+      uuid_v7_primary_key :id, writable?: true
+      attribute :datetime, :datetime, public?: true
+      attribute :utc_datetime, :utc_datetime, public?: true
+      attribute :utc_datetime_usec, :utc_datetime_usec, public?: true
+      attribute :naive_datetime, :naive_datetime, public?: true
+    end
+
+    actions do
+      default_accept [:datetime, :utc_datetime, :utc_datetime_usec, :naive_datetime]
+      defaults [:create, :read]
+    end
+  end
+
+  defmodule Shipment do
+    use Ash.Resource,
+      domain: Music,
+      data_layer: Ash.DataLayer.Ets
+
+    ets do
+      private? true
+    end
+
+    attributes do
+      uuid_v7_primary_key :id, writable?: true
+
+      attribute :package, :keyword,
+        public?: true,
+        constraints: [
+          fields: [
+            label: [type: :string, allow_nil?: false],
+            weight: [type: :integer]
+          ]
+        ]
+
+      attribute :destination, :tuple,
+        public?: true,
+        constraints: [
+          fields: [
+            lat: [type: :float, allow_nil?: false],
+            lng: [type: :float, allow_nil?: false]
+          ]
+        ]
+
+      attribute :transit_time, :duration, public?: true
+    end
+
+    actions do
+      default_accept [:package, :destination, :transit_time]
+      defaults [:create, :read]
+    end
+  end
+
+  defmodule Profile do
+    use Ash.Resource,
+      domain: Music,
+      data_layer: Ash.DataLayer.Ets
+
+    ets do
+      private? true
+    end
+
+    attributes do
+      uuid_v7_primary_key :id, writable?: true
+      attribute :username, :string, public?: true, constraints: [min_length: 3, max_length: 20]
+      attribute :bio, :ci_string, public?: true, constraints: [max_length: 500]
+      attribute :code, :string, public?: true, constraints: [min_length: 5]
+    end
+
+    actions do
+      default_accept [:*]
+      defaults [:create, :read]
+
+      action :validate_code, :string do
+        argument :code, :string, allow_nil?: false, constraints: [min_length: 4, max_length: 8]
+
+        run fn input, _ ->
+          {:ok, input.arguments.code}
+        end
+      end
+    end
+  end
+
   defmodule Music do
     use Ash.Domain,
       extensions: [AshAi]
@@ -156,6 +248,10 @@ defmodule AshAi.OpenApiTest do
     tools do
       tool :list_widgets, Widget, :read
       tool :list_gadgets, Gadget, :read
+      tool :create_event, Event, :create
+      tool :list_events, Event, :read
+      tool :create_shipment, Shipment, :create
+      tool :create_profile, Profile, :create
     end
 
     resources do
@@ -163,6 +259,9 @@ defmodule AshAi.OpenApiTest do
       resource Album
       resource Widget
       resource Gadget
+      resource Event
+      resource Shipment
+      resource Profile
     end
   end
 
@@ -279,10 +378,8 @@ defmodule AshAi.OpenApiTest do
                name: %{type: :string},
                bio: %{
                  type: :object,
-                 properties: %{
-                   birth: %{"anyOf" => [%{type: :string, format: :date}, %{"type" => "null"}]}
-                 },
-                 required: [:birth],
+                 properties: %{birth: %{type: :string, format: :date}},
+                 required: [],
                  additionalProperties: false
                }
              }
@@ -457,6 +554,200 @@ defmodule AshAi.OpenApiTest do
                ],
                "extra"
              )
+    end
+  end
+
+  describe "datetime attributes" do
+    @datetime_fields ~w(datetime utc_datetime utc_datetime_usec naive_datetime)
+
+    test "are date-time strings in write input schemas" do
+      tool =
+        [actions: [{Event, [:create]}]]
+        |> AshAi.exposed_tools()
+        |> hd()
+
+      properties =
+        AshAi.Tools.parameter_schema(tool, strict: false)["properties"]["input"]["properties"]
+
+      for field <- @datetime_fields do
+        assert properties[field] == %{"type" => "string", "format" => "date-time"},
+               "expected #{field} to be a date-time string, got: #{inspect(properties[field])}"
+      end
+    end
+
+    test "are date-time strings in filter schemas" do
+      tool =
+        [actions: [{Event, [:read]}]]
+        |> AshAi.exposed_tools()
+        |> hd()
+        |> struct(full_filter_schema?: true)
+
+      properties =
+        AshAi.Tools.parameter_schema(tool, strict: false)["properties"]["filter"]["properties"]
+
+      for field <- @datetime_fields do
+        assert properties[field]["properties"]["eq"] == %{
+                 "type" => "string",
+                 "format" => "date-time"
+               },
+               "expected #{field} to filter as a date-time string, got: #{inspect(properties[field])}"
+      end
+    end
+  end
+
+  describe "keyword, tuple and duration attributes" do
+    setup do
+      tool =
+        [actions: [{Shipment, [:create]}]]
+        |> AshAi.exposed_tools()
+        |> hd()
+
+      %{tool: tool}
+    end
+
+    test "keywords and tuples are objects of their fields in input schemas", %{tool: tool} do
+      properties =
+        AshAi.Tools.parameter_schema(tool, strict: false)["properties"]["input"]["properties"]
+
+      assert properties["package"] == %{
+               "type" => "object",
+               "properties" => %{
+                 "label" => %{"type" => "string"},
+                 "weight" => %{"type" => "integer"}
+               },
+               "required" => ["label"]
+             }
+
+      assert properties["destination"] == %{
+               "type" => "object",
+               "properties" => %{
+                 "lat" => %{"type" => "number", "format" => "float"},
+                 "lng" => %{"type" => "number", "format" => "float"}
+               },
+               "required" => ["lat", "lng"]
+             }
+    end
+
+    test "strict schemas require every field of a keyword, making the optional ones nullable", %{
+      tool: tool
+    } do
+      properties =
+        AshAi.Tools.parameter_schema(tool, strict: true)["properties"]["input"]["properties"]
+
+      assert properties["package"]["required"] == ["label", "weight"]
+      assert properties["package"]["properties"]["weight"]["type"] == ["integer", "null"]
+      assert properties["package"]["additionalProperties"] == false
+    end
+
+    test "durations are ISO 8601 duration strings in input schemas", %{tool: tool} do
+      properties =
+        AshAi.Tools.parameter_schema(tool, strict: false)["properties"]["input"]["properties"]
+
+      assert properties["transit_time"] == %{"type" => "string", "format" => "duration"}
+    end
+
+    test "keyword and duration input casts, and is returned in the same shape", %{tool: tool} do
+      assert {:ok, json, _} =
+               AshAi.Tools.execute(
+                 tool,
+                 %{
+                   "input" => %{
+                     "package" => %{"label" => "books", "weight" => 3},
+                     "transit_time" => "P2DT4H"
+                   }
+                 },
+                 %{}
+               )
+
+      assert %{
+               "package" => %{"label" => "books", "weight" => 3},
+               "transit_time" => "P2DT4H"
+             } = Jason.decode!(json)
+    end
+
+    test "tuple input casts from an object, and is returned as one", %{tool: tool} do
+      assert {:ok, json, _} =
+               AshAi.Tools.execute(
+                 tool,
+                 %{"input" => %{"destination" => %{"lat" => 51.5, "lng" => -0.12}}},
+                 %{}
+               )
+
+      assert %{"destination" => %{"lat" => 51.5, "lng" => -0.12}} = Jason.decode!(json)
+    end
+  end
+
+  describe "string attributes and arguments with length constraints" do
+    test "exposes minLength and maxLength in resource_write_attribute_type/3" do
+      create_action = Ash.Resource.Info.action(Profile, :create)
+
+      properties =
+        get_parameter_schema_properties(
+          create_action,
+          Profile,
+          &AshAi.OpenApi.resource_write_attribute_type/3
+        )
+
+      assert properties[:username] == %{type: :string, minLength: 3, maxLength: 20}
+      assert properties[:bio] == %{type: :string, maxLength: 500}
+      assert properties[:code] == %{type: :string, minLength: 5}
+    end
+
+    test "exposes minLength and maxLength for action arguments" do
+      validate_code_action = Ash.Resource.Info.action(Profile, :validate_code)
+
+      properties =
+        get_parameter_schema_properties(
+          validate_code_action,
+          Profile,
+          &AshAi.OpenApi.resource_write_attribute_type/3
+        )
+
+      assert properties[:code] == %{type: :string, minLength: 4, maxLength: 8}
+    end
+
+    test "exposes minLength and maxLength in tool parameter schemas" do
+      tool =
+        [actions: [{Profile, [:create]}]]
+        |> AshAi.exposed_tools()
+        |> hd()
+
+      properties =
+        AshAi.Tools.parameter_schema(tool, strict: false)["properties"]["input"]["properties"]
+
+      assert properties["username"] == %{
+               "type" => "string",
+               "minLength" => 3,
+               "maxLength" => 20
+             }
+
+      assert properties["bio"] == %{
+               "type" => "string",
+               "maxLength" => 500
+             }
+
+      assert properties["code"] == %{
+               "type" => "string",
+               "minLength" => 5
+             }
+    end
+
+    test "strips minLength and maxLength in strict tool parameter schemas" do
+      tool =
+        [actions: [{Profile, [:create]}]]
+        |> AshAi.exposed_tools()
+        |> hd()
+
+      properties =
+        AshAi.Tools.parameter_schema(tool, strict: true)["properties"]["input"]["properties"]
+
+      assert properties["username"] == %{"type" => ["string", "null"]}
+      assert properties["bio"] == %{"type" => ["string", "null"]}
+      assert properties["code"] == %{"type" => ["string", "null"]}
+      refute Map.has_key?(properties["username"], "minLength")
+      refute Map.has_key?(properties["username"], "maxLength")
+      refute Map.has_key?(properties["bio"], "maxLength")
+      refute Map.has_key?(properties["code"], "minLength")
     end
   end
 

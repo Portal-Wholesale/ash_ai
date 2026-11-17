@@ -14,7 +14,7 @@ defmodule AshAi.Serializer do
   end
 
   def serialize_value(value, Ash.Type.Decimal, _constraints, _domain, _opts) do
-    Decimal.to_string(value)
+    Decimal.to_string(value, :normal)
   end
 
   def serialize_value(%Ash.Union{type: union_type, value: inner}, type, constraints, domain, opts) do
@@ -68,6 +68,11 @@ defmodule AshAi.Serializer do
   defp serialize_typed_value(value, type, constraints, domain, opts)
        when type in [Ash.Type.Map, Ash.Type.Keyword, Ash.Type.Tuple] do
     serialize_fields(value, constraints, domain, opts)
+  end
+
+  # `Duration` has no JSON encoding; ISO 8601 is what `Ash.Type.Duration` casts from.
+  defp serialize_typed_value(%Duration{} = value, Ash.Type.Duration, _constraints, _domain, _opts) do
+    Duration.to_iso8601(value)
   end
 
   defp serialize_typed_value(value, type, _constraints, domain, opts) do

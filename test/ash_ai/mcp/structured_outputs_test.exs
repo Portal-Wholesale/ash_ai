@@ -4,6 +4,7 @@
 
 defmodule AshAi.Mcp.StructuredOutputsTest do
   use ExUnit.Case, async: true
+  import ExUnit.CaptureLog
   import Plug.{Conn, Test}
 
   alias AshAi.Mcp.Router
@@ -60,6 +61,10 @@ defmodule AshAi.Mcp.StructuredOutputsTest do
         run fn _input, _context -> {:ok, "scalar"} end
       end
 
+      action :datetime_result, :utc_datetime do
+        run fn _input, _context -> {:ok, ~U[2026-08-11 12:30:00Z]} end
+      end
+
       action :array_result, {:array, :integer} do
         run fn _input, _context -> {:ok, [1, 2]} end
       end
@@ -75,6 +80,12 @@ defmodule AshAi.Mcp.StructuredOutputsTest do
 
       action :failing_result, :map do
         run fn _input, _context -> {:error, "failed intentionally"} end
+      end
+
+      action :raising_result, :map do
+        run fn _input, _context ->
+          raise FunctionClauseError, module: InternalSecret, function: :check, arity: 2
+        end
       end
 
       action :cast_failure, :map do
@@ -112,10 +123,12 @@ defmodule AshAi.Mcp.StructuredOutputsTest do
       tool :create_record, Resource, :create_record
       tool :map_result, Resource, :map_result
       tool :scalar_result, Resource, :scalar_result
+      tool :datetime_result, Resource, :datetime_result
       tool :array_result, Resource, :array_result
       tool :nil_result, Resource, :nil_result
       tool :unencodable_result, Resource, :unencodable_result
       tool :failing_result, Resource, :failing_result
+      tool :raising_result, Resource, :raising_result
       tool :cast_failure, Resource, :cast_failure
       tool :protected_result, Resource, :protected_result
     end
@@ -157,7 +170,7 @@ defmodule AshAi.Mcp.StructuredOutputsTest do
     test "preserves text-only behavior for non-object results" do
       session_id = initialize()
 
-      for name <- ["scalar_result", "array_result", "nil_result"] do
+      for name <- ["scalar_result", "datetime_result", "array_result", "nil_result"] do
         call_result = call_tool(session_id, name)
 
         assert call_result["isError"] == false
@@ -166,6 +179,7 @@ defmodule AshAi.Mcp.StructuredOutputsTest do
       end
     end
 
+    @tag :capture_log
     test "casting, authorization, and execution errors never contain structured content" do
       session_id = initialize()
 
@@ -185,9 +199,56 @@ defmodule AshAi.Mcp.StructuredOutputsTest do
         refute Map.has_key?(call_result, "structuredContent")
       end
     end
+
+    test "unexpected errors reach the caller as an error id, and the log in full" do
+      session_id = initialize()
+
+      for {name, detail} <- [
+            {"raising_result", "InternalSecret.check/2"},
+            {"failing_result", "failed intentionally"},
+            {"unencodable_result", "#PID<"}
+          ] do
+        {call_result, log} = with_log(fn -> call_tool(session_id, name) end)
+        [%{"type" => "text", "text" => text}] = call_result["content"]
+
+        assert call_result["isError"] == true
+        refute text =~ detail, "#{name} leaked #{inspect(detail)}: #{text}"
+        assert [_, error_id] = Regex.run(~r/unexpected error occurred \(error id: (.+)\)/, text)
+        assert log =~ error_id
+        assert log =~ detail
+      end
+
+      call_result =
+        call_tool(session_id, "cast_failure", %{"input" => %{"count" => "not-an-integer"}})
+
+      [%{"type" => "text", "text" => text}] = call_result["content"]
+      assert text =~ "count"
+      refute text =~ "unexpected error occurred"
+    end
   end
 
   describe "2026-07-28 public router" do
+    test "returns list results as structured content" do
+      call_result =
+        per_request("tools/call", %{"name" => "array_result", "arguments" => %{}})
+        |> result()
+
+      [%{"text" => text}] = call_result["content"]
+      assert call_result["structuredContent"] == [1, 2]
+      assert call_result["structuredContent"] == Jason.decode!(text)
+    end
+
+    test "keeps scalar and nil results text-only" do
+      for name <- ["scalar_result", "datetime_result", "nil_result"] do
+        call_result =
+          per_request("tools/call", %{"name" => name, "arguments" => %{}})
+          |> result()
+
+        assert call_result["isError"] == false
+        refute Map.has_key?(call_result, "structuredContent")
+      end
+    end
+
     test "returns the same structured content without a session" do
       call_result =
         per_request("tools/call", %{"name" => "map_result", "arguments" => %{}})

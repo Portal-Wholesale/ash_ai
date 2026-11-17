@@ -6,7 +6,14 @@ defprotocol AshAi.ToToolError do
   @moduledoc """
   Converts Ash errors into concise readable tool error messages.
 
-  Implementations should return a concise error description.
+  Implementations should return a concise error description. The text is sent
+  to the tool's caller, so it must not include internal details such as module
+  names, stacktraces or values the caller could not otherwise read.
+
+  Errors without an implementation, including `Ash.Error.Unknown.UnknownError`
+  (raised exceptions and bare `{:error, term}` returns), are logged with an
+  error id and sent to the caller as "unexpected error occurred (error id: ...)".
+  Implement this protocol for your own exceptions to send their text instead.
 
   ## Example
 
@@ -38,31 +45,31 @@ end
 
 defimpl AshAi.ToToolError, for: Ash.Error.Changes.InvalidAttribute do
   def to_tool_error(error) do
-    error.message || "is invalid"
+    AshAi.ToToolError.Message.interpolate(error) || "is invalid"
   end
 end
 
 defimpl AshAi.ToToolError, for: Ash.Error.Changes.InvalidChanges do
   def to_tool_error(error) do
-    error.message || "is invalid"
+    AshAi.ToToolError.Message.interpolate(error) || "is invalid"
   end
 end
 
 defimpl AshAi.ToToolError, for: Ash.Error.Changes.InvalidArgument do
   def to_tool_error(error) do
-    error.message || "is invalid"
+    AshAi.ToToolError.Message.interpolate(error) || "is invalid"
   end
 end
 
 defimpl AshAi.ToToolError, for: Ash.Error.Query.InvalidArgument do
   def to_tool_error(error) do
-    error.message || "is invalid"
+    AshAi.ToToolError.Message.interpolate(error) || "is invalid"
   end
 end
 
 defimpl AshAi.ToToolError, for: Ash.Error.Action.InvalidArgument do
   def to_tool_error(error) do
-    error.message || "is invalid"
+    AshAi.ToToolError.Message.interpolate(error) || "is invalid"
   end
 end
 
@@ -74,7 +81,7 @@ end
 
 defimpl AshAi.ToToolError, for: Ash.Error.Query.InvalidQuery do
   def to_tool_error(error) do
-    error.message || "invalid query"
+    AshAi.ToToolError.Message.interpolate(error) || "invalid query"
   end
 end
 
@@ -101,8 +108,8 @@ defimpl AshAi.ToToolError, for: Ash.Error.Query.NoSuchFilterPredicate do
 end
 
 defimpl AshAi.ToToolError, for: Ash.Error.Query.InvalidFilterValue do
-  def to_tool_error(%{value: value, message: message}) do
-    ["invalid filter value #{inspect(value)}", message]
+  def to_tool_error(%{value: value} = error) do
+    ["invalid filter value #{inspect(value)}", AshAi.ToToolError.Message.interpolate(error)]
     |> Enum.reject(&(&1 in [nil, ""]))
     |> Enum.join(": ")
   end
