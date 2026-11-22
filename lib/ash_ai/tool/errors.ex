@@ -20,27 +20,32 @@ defmodule AshAi.Tool.Errors do
   a one-arity function or a `{module, function, extra_args}` tuple, called with
   each underlying Ash error. Returning a string uses that text verbatim for the
   error; returning `nil` keeps the default `AshAi.ToToolError` text.
+
+  `log_context` is only read when an error has no `AshAi.ToToolError`
+  implementation, to make the warning logged for it traceable: `:tool` (the tool
+  name) and `:stacktrace` (the stacktrace of the rescued exception). It never
+  carries tool arguments.
   """
-  def format(error, error_formatter \\ nil) do
+  def format(error, error_formatter \\ nil, log_context \\ []) do
     error
     |> Ash.Error.to_error_class()
     |> Map.get(:errors, [])
-    |> Enum.map_join("\n", &format_with(&1, error_formatter))
+    |> Enum.map_join("\n", &format_with(&1, error_formatter, log_context))
     |> case do
       "" -> "Tool execution failed"
       text -> text
     end
   end
 
-  defp format_with(error, nil), do: format_single_error(error)
+  defp format_with(error, nil, log_context), do: format_single_error(error, log_context)
 
-  defp format_with(error, error_formatter) do
+  defp format_with(error, error_formatter, log_context) do
     case apply_formatter(error_formatter, error) do
       text when is_binary(text) ->
         text
 
       nil ->
-        format_single_error(error)
+        format_single_error(error, log_context)
 
       other ->
         raise ArgumentError,
@@ -59,18 +64,24 @@ defmodule AshAi.Tool.Errors do
           "error_formatter must be a one-arity function or {module, function, args}, got: #{inspect(other)}"
   end
 
-  defp format_single_error(%{fields: fields} = error) when is_list(fields) and fields != [] do
+  defp format_single_error(error, log_context)
+
+  defp format_single_error(%{fields: fields} = error, log_context)
+       when is_list(fields) and fields != [] do
     Enum.map_join(fields, "\n", fn field ->
-      error |> Map.put(:fields, nil) |> Map.put(:field, field) |> format_single_error()
+      error
+      |> Map.put(:fields, nil)
+      |> Map.put(:field, field)
+      |> format_single_error(log_context)
     end)
   end
 
-  defp format_single_error(error) do
+  defp format_single_error(error, log_context) do
     msg =
       if AshAi.ToToolError.impl_for(error) do
         AshAi.ToToolError.to_tool_error(error)
       else
-        unexpected_error(error)
+        unexpected_error(error, log_context)
       end
 
     case {Map.get(error, :path, []), Map.get(error, :field)} do
@@ -85,17 +96,24 @@ defmodule AshAi.Tool.Errors do
   # The error's text can name internal modules and carry values the caller
   # could never read (raised exceptions, `{:error, term}` returns, results that
   # failed to encode), so the caller only gets an id to match against the log.
-  defp unexpected_error(error) do
+  defp unexpected_error(error, log_context) do
     error_id = Ash.UUID.generate()
 
     stacktrace =
-      case error do
-        %{stacktrace: %{stacktrace: stacktrace}} when is_list(stacktrace) -> stacktrace
+      case {Keyword.get(log_context, :stacktrace), error} do
+        {[_ | _] = stacktrace, _} -> stacktrace
+        {_, %{stacktrace: %{stacktrace: stacktrace}}} when is_list(stacktrace) -> stacktrace
         _ -> []
       end
 
+    tool =
+      case Keyword.get(log_context, :tool) do
+        nil -> ""
+        name -> " in tool `#{name}`"
+      end
+
     Logger.warning("""
-    `#{error_id}`: AshAi.ToToolError not implemented for #{inspect(error.__struct__)}, returning a generic error message.
+    `#{error_id}`: AshAi.ToToolError not implemented for #{inspect(error.__struct__)}#{tool}, returning a generic error message.
 
     #{Exception.format(:error, error, stacktrace)}\
     """)

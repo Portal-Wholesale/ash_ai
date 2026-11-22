@@ -45,6 +45,21 @@ defmodule AshAi.Tool.ErrorsTest do
       assert result =~ "\n"
     end
 
+    test "the fallback warning names the tool and the stacktrace, not the arguments" do
+      error = %RuntimeError{message: "boom"}
+      stacktrace = [{__MODULE__, :some_function, 0, [file: ~c"some_file.ex", line: 7]}]
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert "unexpected error occurred (error id: " <> _ =
+                   Errors.format(error, nil, tool: :list_things, stacktrace: stacktrace)
+        end)
+
+      assert log =~ "in tool `list_things`"
+      assert log =~ "some_function/0"
+      assert log =~ "some_file.ex:7"
+    end
+
     @tag :capture_log
     test "returns a string for any error input" do
       result = Errors.format("something went wrong")

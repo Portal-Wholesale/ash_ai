@@ -107,7 +107,11 @@ defmodule AshAi.Tool.Execution do
         end
       rescue
         error ->
-          {:error, Errors.format(error, Keyword.get(run_opts, :error_formatter))}
+          {:error,
+           Errors.format(error, Keyword.get(run_opts, :error_formatter),
+             tool: tool.name,
+             stacktrace: __STACKTRACE__
+           )}
       catch
         {:tool_error, error_msg} ->
           {:error, error_msg}
@@ -168,17 +172,31 @@ defmodule AshAi.Tool.Execution do
     |> serialize_record(resource, ctx)
   end
 
+  defp build_sort(nil), do: ""
+
   defp build_sort(sort) when is_list(sort) do
-    sort
-    |> Enum.map_join(",", fn map ->
-      case map["direction"] || "asc" do
-        "asc" -> map["field"]
-        "desc" -> "-#{map["field"]}"
-      end
+    Enum.map_join(sort, ",", fn
+      %{"field" => field} = entry when is_binary(field) ->
+        case Map.get(entry, "direction") || "asc" do
+          "asc" -> field
+          "desc" -> "-#{field}"
+          other -> invalid_sort!(other)
+        end
+
+      other ->
+        invalid_sort!(other)
     end)
   end
 
-  defp build_sort(_), do: ""
+  defp build_sort(other), do: invalid_sort!(other)
+
+  defp invalid_sort!(got) do
+    throw(
+      {:tool_error,
+       "sort: must be an array of objects like {\"field\": \"name\", \"direction\": \"asc\"} " <>
+         "(direction is \"asc\" or \"desc\"), got: #{inspect(got, limit: 5, printable_limit: 80)}"}
+    )
+  end
 
   # A tool's `filterable_fields`, `sortable_fields` and `aggregatable_fields` narrow
   # what its schema offers; requests naming any other field are refused rather

@@ -192,6 +192,34 @@ defmodule AshAi.ToolQueryFieldsTest do
                execute(:read_narrow, %{"sort" => [%{"field" => "name", "direction" => "asc"}]})
     end
 
+    test "sort entries that are not field/direction objects are refused, naming sort" do
+      for sort <- [
+            ["price"],
+            [1],
+            [["price"]],
+            [%{"field" => 1}],
+            [%{"direction" => "asc"}],
+            [%{"field" => "price", "direction" => "up"}],
+            "price"
+          ] do
+        assert {:error, "sort: must be an array of objects" <> _} =
+                 execute(:read_widgets, %{"sort" => sort})
+      end
+    end
+
+    test "object sorts, and no sort, still run" do
+      assert {:ok, json, _} =
+               execute(:read_widgets, %{"sort" => [%{"field" => "price", "direction" => "desc"}]})
+
+      assert %{"results" => [%{"price" => 2}, %{"price" => 1}]} = Jason.decode!(json)
+
+      assert {:ok, json, _} = execute(:read_widgets, %{"sort" => [%{"field" => "price"}]})
+      assert %{"results" => [%{"price" => 1}, %{"price" => 2}]} = Jason.decode!(json)
+
+      assert {:ok, _, _} = execute(:read_widgets, %{"sort" => nil})
+      assert {:ok, _, _} = execute(:read_widgets, %{})
+    end
+
     test "aggregates of other fields are refused" do
       assert {:error, "Cannot aggregate `name`. Allowed fields: price"} =
                execute(:read_narrow, %{
