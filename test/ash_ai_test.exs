@@ -140,10 +140,13 @@ defmodule AshAiTest do
 
       schema = AshAi.Tools.parameter_schema(tool, strict: true)
 
-      # strict mode makes the optional result_type nullable, including in the enum
-      result_type = schema["properties"]["result_type"]
-      assert result_type["type"] == ["string", "null"]
-      assert result_type["enum"] == ["run_query", "count", nil]
+      # strict mode makes the optional result_type nullable; an enum is wrapped in anyOf
+      # (Anthropic refuses an enum whose type is a list)
+      assert %{"anyOf" => [%{"type" => "null"}, result_type]} =
+               schema["properties"]["result_type"]
+
+      assert result_type["type"] == "string"
+      assert result_type["enum"] == ["run_query", "count"]
       refute Map.has_key?(schema["properties"], "sort")
       assert Map.has_key?(schema["properties"], "filter")
       assert Map.has_key?(schema["properties"], "limit")
@@ -152,6 +155,18 @@ defmodule AshAiTest do
       assert Map.has_key?(schema["properties"], "offset")
       assert Map.has_key?(schema["properties"], "after")
       assert Map.has_key?(schema["properties"], "before")
+    end
+
+    test "strict mode keeps annotations on a nullable union result_type" do
+      [tool] = AshAi.list_tools(actions: [{Artist, [:read]}], strict: true)
+
+      result_type = tool.parameter_schema["properties"]["result_type"]
+
+      assert result_type["default"] == "run_query"
+      assert result_type["description"] == "The type of result to return"
+      assert [%{"type" => "null"}, %{"anyOf" => [_, _]} = inner] = result_type["anyOf"]
+      refute Map.has_key?(inner, "default")
+      refute Map.has_key?(inner, "description")
     end
 
     test "full_filter_schema? generates the full strict filter schema" do
